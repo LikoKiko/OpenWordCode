@@ -50,7 +50,7 @@ they use the in-memory Word adapter and cannot validate a live document.
 From a fresh checkout:
 
 ```powershell
-git clone https://github.com/YOUR_GITHUB_USERNAME/OpenWordCode.git
+git clone https://github.com/LikoKiko/OpenWordCode.git
 cd OpenWordCode
 npm ci
 Copy-Item .env.example .env
@@ -58,8 +58,7 @@ npm run cert:install
 npm run dev
 ```
 
-Replace `YOUR_GITHUB_USERNAME` with the repository owner's account. The
-development processes listen on:
+The development processes listen on:
 
 - Core: `http://127.0.0.1:10200`
 - Word task pane: `https://localhost:3000`
