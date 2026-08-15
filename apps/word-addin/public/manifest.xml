@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<OfficeApp xmlns="http://schemas.microsoft.com/office/appforoffice/1.1" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0" xmlns:ov="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xsi:type="TaskPaneApp">
+  <Id>0f79f3c0-1b11-4d49-98f4-7cf14629a6f5</Id>
+  <Version>1.0.0.10</Version>
+  <ProviderName>OpenWordCode</ProviderName>
+  <DefaultLocale>en-US</DefaultLocale>
+  <DisplayName DefaultValue="OpenWordCode" />
+  <Description DefaultValue="Open AI agents for Microsoft Word." />
+  <IconUrl DefaultValue="https://localhost:3000/icon-32.png?v=20260816-10" />
+  <HighResolutionIconUrl DefaultValue="https://localhost:3000/icon-80.png?v=20260816-10" />
+  <SupportUrl DefaultValue="https://localhost:3000/" />
+  <AppDomains>
+    <AppDomain>https://localhost:3000</AppDomain>
+  </AppDomains>
+  <Hosts><Host Name="Document" /></Hosts>
+  <DefaultSettings><SourceLocation DefaultValue="https://localhost:3000/?v=20260816-10" /></DefaultSettings>
+  <Permissions>ReadWriteDocument</Permissions>
+  <VersionOverrides xmlns="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xsi:type="VersionOverridesV1_0">
+    <Requirements><bt:Sets DefaultMinVersion="1.3"><bt:Set Name="WordApi" /></bt:Sets></Requirements>
+    <Hosts>
+      <Host xsi:type="Document">
+        <DesktopFormFactor>
+          <FunctionFile resid="Commands.Url" />
+          <ExtensionPoint xsi:type="PrimaryCommandSurface">
+            <OfficeTab id="TabHome">
+              <Group id="OpenWordCode.Group">
+                <Label resid="GroupLabel" />
+                <Icon>
+                  <bt:Image size="16" resid="Icon.16" />
+                  <bt:Image size="32" resid="Icon.32" />
+                  <bt:Image size="80" resid="Icon.80" />
+                </Icon>
+                <Control xsi:type="Button" id="OpenWordCode.OpenTaskpane">
+                  <Label resid="TaskpaneButton.Label" />
+                  <Supertip><Title resid="TaskpaneButton.Label" /><Description resid="TaskpaneButton.Tooltip" /></Supertip>
+                  <Icon><bt:Image size="16" resid="Icon.16" /><bt:Image size="32" resid="Icon.32" /><bt:Image size="80" resid="Icon.80" /></Icon>
+                  <Action xsi:type="ShowTaskpane"><TaskpaneId>OpenWordCodeTaskpane</TaskpaneId><SourceLocation resid="Taskpane.Url" /></Action>
+                </Control>
+              </Group>
+            </OfficeTab>
+          </ExtensionPoint>
+        </DesktopFormFactor>
+      </Host>
+    </Hosts>
+    <Resources>
+      <bt:Images><bt:Image id="Icon.16" DefaultValue="https://localhost:3000/icon-16.png?v=20260816-10" /><bt:Image id="Icon.32" DefaultValue="https://localhost:3000/icon-32.png?v=20260816-10" /><bt:Image id="Icon.80" DefaultValue="https://localhost:3000/icon-80.png?v=20260816-10" /></bt:Images>
+      <bt:Urls><bt:Url id="Commands.Url" DefaultValue="https://localhost:3000/commands.html" /><bt:Url id="Taskpane.Url" DefaultValue="https://localhost:3000/?v=20260816-10" /></bt:Urls>
+      <bt:ShortStrings><bt:String id="GroupLabel" DefaultValue="OpenWordCode" /><bt:String id="TaskpaneButton.Label" DefaultValue="OpenWordCode" /></bt:ShortStrings>
+      <bt:LongStrings><bt:String id="TaskpaneButton.Tooltip" DefaultValue="Open the OpenWordCode document agent" /></bt:LongStrings>
+    </Resources>
+  </VersionOverrides>
+</OfficeApp>
