@@ -1,5 +1,11 @@
 # OpenWordCode
 
+<p align="center">
+  <img src="apps/word-addin/public/openwordcode-logo.png" alt="OpenWordCode logo" width="280" />
+</p>
+
+<p align="center"><strong>Open-source AI document agents for Microsoft Word</strong></p>
+
 OpenWordCode is an open-source AI document agent for Microsoft Word. It runs a
 local TypeScript Core beside a React task pane, reads the Word context needed
 for a request, and turns document changes into reviewable, tracked edits.
