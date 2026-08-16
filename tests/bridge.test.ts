@@ -9,7 +9,7 @@ const created: string[] = [];
 afterEach(() => { for (const path of created.splice(0)) rmSync(path, { recursive: true, force: true }); });
 
 describe("OpenWordCode Bridge", () => {
-  it("owns the local compatibility surface and routes chat completions without OpenCodex", async () => {
+  it("owns the local compatibility surface and routes chat completions standalone", async () => {
     const directory = mkdtempSync(join(tmpdir(), "openwordcode-bridge-test-"));
     created.push(directory);
     const state = createCoreState({

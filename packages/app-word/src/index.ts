@@ -793,6 +793,43 @@ function executeOfficeRangeOperation(target: OfficeRangeLike, operation: WordRan
     }
   }
   if (!isWordRangeMethod(operation.name)) return { success: false, message: `Unsupported Word.Range member: ${operation.name}` };
+  if (operation.name === "insertTable") {
+    const rawArgs = operation.args ?? [];
+    const rowCount = Math.max(1, Math.min(100, Number(rawArgs[0]) || 1));
+    const colCount = Math.max(1, Math.min(100, Number(rawArgs[1]) || 1));
+    const location = typeof rawArgs[2] === "string" ? rawArgs[2] : "After";
+    const rawValues = Array.isArray(rawArgs[3]) ? rawArgs[3] : [];
+    const values: string[][] = Array.from({ length: rowCount }, (_unused, rIdx) => {
+      const row = Array.isArray(rawValues[rIdx]) ? rawValues[rIdx] : [];
+      return Array.from({ length: colCount }, (_cell, cIdx) => String(row[cIdx] ?? ""));
+    });
+    const hasNonEmptyText = values.some(row => row.some(cell => cell.trim().length > 0));
+    if (typeof target.insertTable === "function") {
+      try {
+        if (hasNonEmptyText) {
+          target.insertTable(rowCount, colCount, location, values);
+        } else {
+          target.insertTable(rowCount, colCount, location);
+        }
+        return { success: true };
+      } catch {
+        // fallback to insertHtml below
+      }
+    }
+    if (typeof target.insertHtml === "function") {
+      try {
+        target.insertHtml(tableHtml(values), location);
+        return { success: true };
+      } catch {
+        // fallback
+      }
+    }
+    if (typeof target.insertText === "function") {
+      target.insertText(values.map(row => row.join("\t")).join("\n"), location);
+      return { success: true };
+    }
+    return { success: false, message: "Word host cannot insert tables at this location" };
+  }
   const member = record[operation.name];
   if (typeof member !== "function") {
     if (operation.name === "insertHtml" && typeof target.insertText === "function" && typeof operation.args?.[0] === "string") {
@@ -1057,19 +1094,15 @@ export class OfficeWordAdapter implements WordApplicationAdapter {
             if (!paragraph) return { success: false, message: "The target paragraph changed before this edit could be applied. Refresh the document context and try again." };
             target = paragraph;
           }
-          if (operation?.name === "insertTable" && typeof target.insertTable !== "function") {
-            const args = operation.args ?? [];
-            const values = Array.isArray(args[3]) ? args[3].map(row => Array.isArray(row) ? row.map(cell => String(cell ?? "")) : []) : [];
-            if (!values.length || !values[0]?.length || typeof target.insertHtml !== "function") return { success: false, message: "This Word host does not expose table insertion. Update Office or use WordApi 1.3+ in the desktop host." };
-            const location = typeof args[2] === "string" ? args[2] : "After";
-            target.insertHtml(tableHtml(values), location);
-          } else if (operation) {
+          if (operation) {
             const executed = executeOfficeRangeOperation(target, operation);
             if (!executed.success) return executed;
           } else if (tableValues) {
             if (typeof target.insertTable === "function") {
               if (target.text) target.insertText("", "Replace");
-              target.insertTable(tableValues.length, tableValues[0]!.length, "After", tableValues);
+              const hasNonEmpty = tableValues.some(row => row.some(cell => cell.trim().length > 0));
+              if (hasNonEmpty) target.insertTable(tableValues.length, tableValues[0]!.length, "After", tableValues);
+              else target.insertTable(tableValues.length, tableValues[0]!.length, "After");
             } else if (typeof target.insertHtml === "function") {
               target.insertHtml(tableHtml(tableValues), "After");
             } else {

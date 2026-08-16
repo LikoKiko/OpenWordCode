@@ -65,15 +65,6 @@ export async function saveSettings(patch: Partial<Pick<AgentRequest, "mode">> & 
   await request("/api/settings", { method: "PUT", body: JSON.stringify(patch) });
 }
 
-export async function saveApiKey(providerId: string, key: string, label?: string): Promise<ProviderSummary> {
-  const payload = await request<{ auth: ProviderSummary["auth"] }>(`/api/providers/${encodeURIComponent(providerId)}/credentials`, { method: "POST", body: JSON.stringify({ key, label }) });
-  return { auth: payload.auth } as ProviderSummary;
-}
-
-export async function setAuthMethod(providerId: string, method: string, envVar?: string): Promise<void> {
-  await request(`/api/providers/${encodeURIComponent(providerId)}/auth`, { method: "PUT", body: JSON.stringify({ method, envVar }) });
-}
-
 export interface ChatGPTLoginStart {
   flowId: string;
   authorizeUrl: string;
@@ -87,8 +78,22 @@ export interface ChatGPTLoginStatus {
   detail: string;
 }
 
+export interface CodexCliLoginLaunch {
+  ok: true;
+  executable: string;
+  command: string;
+}
+
 export async function startChatGPTLogin(): Promise<ChatGPTLoginStart> {
   return request<ChatGPTLoginStart>("/api/auth/chatgpt/start", { method: "POST", body: "{}" });
+}
+
+export async function startCodexCliLogin(): Promise<CodexCliLoginLaunch> {
+  return request<CodexCliLoginLaunch>("/api/auth/chatgpt/start-codex-cli-login", { method: "POST", body: "{}" });
+}
+
+export async function useCodexCliSession(): Promise<void> {
+  await request("/api/auth/chatgpt/use-codex-cli", { method: "POST", body: "{}" });
 }
 
 export async function getChatGPTLoginStatus(flowId: string): Promise<ChatGPTLoginStatus> {
@@ -125,6 +130,13 @@ export interface OAuthLoginStart {
 
 export type OAuthLoginStatus = OAuthLoginStart;
 
+export interface LocalCliLoginLaunch {
+  ok: true;
+  providerId: string;
+  executable: string;
+  command: string;
+}
+
 export async function getOAuthProviders(): Promise<OAuthProviderOption[]> {
   const payload = await request<{ providers: OAuthProviderOption[] }>("/api/oauth/providers");
   return payload.providers;
@@ -134,8 +146,20 @@ export async function startOAuthLogin(providerId: string): Promise<OAuthLoginSta
   return request<OAuthLoginStart>(`/api/oauth/${encodeURIComponent(providerId)}/start`, { method: "POST", body: "{}" });
 }
 
+export async function startLocalCliLogin(providerId: string): Promise<LocalCliLoginLaunch> {
+  return request<LocalCliLoginLaunch>(`/api/oauth/${encodeURIComponent(providerId)}/local-cli/start`, { method: "POST", body: "{}" });
+}
+
+export async function useLocalCliSession(providerId: string): Promise<void> {
+  await request(`/api/oauth/${encodeURIComponent(providerId)}/local-cli/use`, { method: "POST", body: "{}" });
+}
+
 export async function getOAuthLoginStatus(flowId: string): Promise<OAuthLoginStatus> {
   return request<OAuthLoginStatus>(`/api/oauth/flows/${encodeURIComponent(flowId)}`);
+}
+
+export async function completeOAuthLogin(flowId: string, code: string): Promise<OAuthLoginStatus> {
+  return request<OAuthLoginStatus>(`/api/oauth/flows/${encodeURIComponent(flowId)}/complete`, { method: "POST", body: JSON.stringify({ code }) });
 }
 
 export async function cancelOAuthLogin(flowId: string): Promise<void> {

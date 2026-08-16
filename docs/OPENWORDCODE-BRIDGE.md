@@ -1,6 +1,6 @@
 # OpenWordCode Bridge
 
-OpenWordCode includes its own loopback compatibility gateway. It is started by `npm run start` / `npm run dev:core` together with Core, so the Word add-in no longer depends on OpenCodex or any other local proxy.
+OpenWordCode includes its own loopback compatibility gateway. It is started by `npm run start` / `npm run dev:core` together with Core, so the Word add-in operates independently without any external local proxy.
 
 ## Local surface
 
@@ -29,6 +29,6 @@ Set `OPENWORDCODE_BRIDGE_PORT` to change the listener. The task-pane provider is
 
 ## Open-source boundary
 
-This gateway is OpenWordCode code. It has no runtime dependency on the sibling `opencodex` project and does not use an OpenCodex client ID, token, cookie, admin API, or credential store. The account OAuth client ID still must belong to the OpenWordCode deployment and must be supplied through environment configuration rather than committed to GitHub.
+This gateway is OpenWordCode code. It operates completely standalone and does not rely on third-party proxies, browser cookies, or external credential stores. The account OAuth client ID belongs to the OpenWordCode deployment and can be customized through environment variables if needed.
 
-The account transport is experimental and is separate from the documented OpenAI Platform API. Deployments that use the Platform API can pin the bridge to a configured API-key provider instead.
+The account transport is experimental and is separate from the documented OpenAI Platform API. The public Word task pane is account-first; deployments with older Core configurations may still have a legacy direct-provider credential behind the bridge, but new API-key setup is intentionally not exposed.

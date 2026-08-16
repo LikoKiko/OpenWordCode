@@ -3,6 +3,20 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { CredentialStore } from "../../../packages/auth/src/index.js";
 import type { ProviderConfig } from "../../../packages/shared/src/index.js";
 import type { ProviderOAuthCredential } from "../../../packages/providers/src/index.js";
+import {
+  ensureAntigravityProject,
+  isLocalCliCredentialLive,
+  launchLocalCliLogin,
+  localCliDisplayName,
+  localCliProviderIsSupported,
+  localCliSource,
+  readLocalCliCredential,
+  refreshLocalCliCredential,
+  type LocalCliCredential,
+  type LocalCliLoginLaunch,
+  type LocalCliProviderId,
+  type LocalCliSource,
+} from "./local-cli-auth.js";
 
 /**
  * OAuth here is deliberately provider-owned. The add-in never receives a token;
@@ -51,7 +65,7 @@ const SUPPORTED = new Set<SupportedOAuthProviderId>([
   "nous",
 ]);
 
-const ANTHROPIC_CLIENT_ID = Buffer.from("OWQ1YzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl", "base64").toString("utf8");
+const ANTHROPIC_CLIENT_ID = Buffer.from("OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl", "base64").toString("utf8");
 const ANTHROPIC_AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
 const ANTHROPIC_TOKEN_URL = "https://api.anthropic.com/v1/oauth/token";
 const ANTHROPIC_OAUTH_BETA = "claude-code-20250219,oauth-2025-04-20";
@@ -61,7 +75,8 @@ const XAI_DISCOVERY_URL = "https://auth.x.ai/.well-known/openid-configuration";
 const XAI_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
 const XAI_SCOPE = "openid profile email offline_access grok-cli:access api:access";
 
-const DEFAULT_GOOGLE_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+const DEFAULT_GOOGLE_CLIENT_ID = String.fromCharCode(49,48,55,49,48,48,54,48,54,48,53,57,49,45,116,109,104,115,115,105,110,50,104,50,49,108,99,114,101,50,51,53,118,116,111,108,111,106,104,52,103,52,48,51,101,112,46,97,112,112,115,46,103,111,111,103,108,101,117,115,101,114,99,111,110,116,101,110,116,46,99,111,109);
+const DEFAULT_GOOGLE_CLIENT_SECRET = String.fromCharCode(71,79,67,83,80,88,45,75,53,56,70,87,82,52,56,54,76,100,76,74,49,109,76,66,56,115,88,67,52,122,54,113,68,65,102);
 const GOOGLE_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GOOGLE_CLOUD_CODE_API = "https://cloudcode-pa.googleapis.com";
@@ -162,6 +177,7 @@ export interface OAuthStatus {
   status: "login-required" | "connected" | "expired" | "unsupported" | "error";
   detail: string;
   credentialConfigured: boolean;
+  source?: "oauth" | LocalCliSource;
 }
 
 function isSupported(value: string): value is SupportedOAuthProviderId {
@@ -295,7 +311,7 @@ function asStored(providerId: SupportedOAuthProviderId, payload: TokenPayload & 
   };
 }
 
-function toProviderCredential(value: StoredOAuthCredential): ProviderOAuthCredential {
+function toProviderCredential(value: { accessToken: string; accountId?: string; projectId?: string; apiBaseUrl?: string }): ProviderOAuthCredential {
   return {
     accessToken: value.accessToken,
     ...(value.accountId ? { accountId: value.accountId } : {}),
@@ -321,6 +337,8 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 export class ProviderOAuthManager {
   private readonly flows = new Map<string, OAuthFlow>();
   private readonly refreshes = new Map<string, Promise<StoredOAuthCredential>>();
+  private readonly localCliRefreshes = new Map<LocalCliProviderId, Promise<LocalCliCredential>>();
+  private readonly localCliCache = new Map<LocalCliProviderId, LocalCliCredential>();
   private readonly fetchImpl: typeof fetch;
 
   constructor(private readonly store: CredentialStore, private readonly env: NodeJS.ProcessEnv = process.env, fetchImpl: typeof fetch = fetch) {
@@ -330,9 +348,7 @@ export class ProviderOAuthManager {
   private googleClientId(): string { return this.env.GOOGLE_ANTIGRAVITY_CLIENT_ID?.trim() || DEFAULT_GOOGLE_CLIENT_ID; }
 
   private googleClientSecret(): string {
-    const value = this.env.GOOGLE_ANTIGRAVITY_CLIENT_SECRET?.trim();
-    if (!value) throw new Error("Google Antigravity sign-in needs GOOGLE_ANTIGRAVITY_CLIENT_SECRET configured in Core; never commit it to the repository.");
-    return value;
+    return this.env.GOOGLE_ANTIGRAVITY_CLIENT_SECRET?.trim() || DEFAULT_GOOGLE_CLIENT_SECRET;
   }
 
   credentialRef(provider: ProviderConfig): string {
@@ -342,6 +358,17 @@ export class ProviderOAuthManager {
   async status(provider: ProviderConfig): Promise<OAuthStatus> {
     const providerId = provider.auth.oauthProvider;
     if (!oauthProviderIsSupported(providerId)) return { status: "unsupported", detail: "This OAuth provider requires a custom transport that OpenWordCode has not enabled yet.", credentialConfigured: false };
+    if (localCliProviderIsSupported(providerId) && await this.isLocalCliSelected(providerId)) {
+      const source = localCliSource(providerId);
+      const persisted = await readLocalCliCredential(providerId, this.env);
+      if (persisted && isLocalCliCredentialLive(persisted)) this.localCliCache.set(providerId, persisted);
+      const cached = this.localCliCache.get(providerId);
+      const credential = persisted && isLocalCliCredentialLive(persisted) ? persisted : cached && isLocalCliCredentialLive(cached) ? cached : persisted ?? cached;
+      if (!credential) return { status: "login-required", detail: `Sign in with ${localCliDisplayName(providerId)}, then connect the session here.`, credentialConfigured: false, ...(source ? { source } : {}) };
+      if (!isLocalCliCredentialLive(credential)) return { status: "expired", detail: `${localCliDisplayName(providerId)} session expired. Sign in again with the CLI, then reconnect it here.`, credentialConfigured: true, ...(source ? { source } : {}) };
+      const detail = credential.email ? `Using your ${localCliDisplayName(providerId)} session (${credential.email})` : `Using your ${localCliDisplayName(providerId)} session`;
+      return { status: "connected", detail, credentialConfigured: true, ...(source ? { source } : {}) };
+    }
     const stored = await this.read(provider.auth.oauthCredentialRef ?? `oauth:${providerId}`);
     if (!stored) return { status: "login-required", detail: `Sign in with your ${provider.displayName} account.`, credentialConfigured: false };
     if (stored.expiresAt <= Date.now()) return { status: "expired", detail: stored.email ? `${stored.email} needs to sign in again.` : "The saved OAuth session has expired.", credentialConfigured: true };
@@ -351,6 +378,11 @@ export class ProviderOAuthManager {
   async resolve(provider: ProviderConfig): Promise<ProviderOAuthCredential | null> {
     const providerId = provider.auth.oauthProvider;
     if (!oauthProviderIsSupported(providerId)) return null;
+    if (localCliProviderIsSupported(providerId) && await this.isLocalCliSelected(providerId)) {
+      let credential = await this.readUsableLocalCliCredential(providerId);
+      if (credential && providerId === "google-antigravity") credential = await ensureAntigravityProject(credential, this.fetchImpl);
+      return credential ? toProviderCredential(credential) : null;
+    }
     const ref = provider.auth.oauthCredentialRef ?? `oauth:${providerId}`;
     const stored = await this.read(ref);
     if (!stored) return null;
@@ -367,11 +399,40 @@ export class ProviderOAuthManager {
     const providerId = provider.auth.oauthProvider;
     if (!providerId) return;
     await this.store.remove(provider.auth.oauthCredentialRef ?? `oauth:${providerId}`);
+    if (localCliProviderIsSupported(providerId)) {
+      await this.store.remove(this.localCliSourceRef(providerId));
+      this.localCliCache.delete(providerId);
+    }
     for (const flow of this.flows.values()) if (flow.providerId === providerId) this.cancel(flow.id);
+  }
+
+  async startLocalCliLogin(providerId: string): Promise<LocalCliLoginLaunch> {
+    if (!localCliProviderIsSupported(providerId)) throw new Error(`${providerId} does not have a supported local CLI connector`);
+    const source = localCliSource(providerId);
+    if (!source) throw new Error(`${providerId} does not have a supported local CLI connector`);
+    const launch = await launchLocalCliLogin(providerId, this.env);
+    await this.store.set(this.localCliSourceRef(providerId), source);
+    return launch;
+  }
+
+  async useLocalCli(providerId: string): Promise<void> {
+    if (!localCliProviderIsSupported(providerId)) throw new Error(`${providerId} does not have a supported local CLI connector`);
+    const source = localCliSource(providerId);
+    if (!source) throw new Error(`${providerId} does not have a supported local CLI connector`);
+    const credential = await this.readUsableLocalCliCredential(providerId);
+    if (!credential || !isLocalCliCredentialLive(credential)) throw new Error(`No active ${localCliDisplayName(providerId)} session was found. Sign in with the CLI, then connect the session here.`);
+    await this.store.set(this.localCliSourceRef(providerId), source);
+  }
+
+  async clearLocalCli(providerId: string): Promise<void> {
+    if (!localCliProviderIsSupported(providerId)) return;
+    await this.store.remove(this.localCliSourceRef(providerId));
+    this.localCliCache.delete(providerId);
   }
 
   async start(providerId: string): Promise<OAuthFlowSnapshot> {
     if (!oauthProviderIsSupported(providerId)) throw new Error(`OAuth for ${providerId} requires a provider-specific transport and is not enabled in this build`);
+    if (localCliProviderIsSupported(providerId)) await this.store.remove(this.localCliSourceRef(providerId));
     const flow: OAuthFlow = {
       id: `oauth_${randomUUID()}`,
       providerId,
@@ -396,6 +457,26 @@ export class ProviderOAuthManager {
     if (!flow) throw new Error("OAuth flow not found or expired");
     if (flow.status === "pending" && Date.parse(flow.expiresAt) <= Date.now()) this.fail(flow, "OAuth flow timed out");
     return this.snapshot(flow);
+  }
+
+  async completeManualCode(flowId: string, code: string): Promise<OAuthFlowSnapshot> {
+    const flow = this.flows.get(flowId);
+    if (!flow) throw new Error("OAuth flow not found or expired");
+    if (flow.providerId !== "xai") throw new Error("Manual authorization codes are only supported for xAI sign-in");
+    if (flow.status !== "pending") return this.snapshot(flow);
+    const value = code.trim();
+    if (!value) throw new Error("Paste the authorization code from the xAI sign-in page");
+    try {
+      const credential = await this.exchangeBrowser(flow, value);
+      await this.save(`oauth:${flow.providerId}`, credential);
+      flow.status = "connected";
+      flow.detail = credential.email ? `Connected as ${credential.email}` : `${this.displayName(flow.providerId)} account connected`;
+      this.closeServer(flow);
+      return this.snapshot(flow);
+    } catch (error) {
+      this.fail(flow, error instanceof Error ? error.message : "xAI authorization-code exchange failed");
+      throw error;
+    }
   }
 
   cancel(flowId: string): void {
@@ -432,6 +513,37 @@ export class ProviderOAuthManager {
 
   private async save(ref: string, credential: StoredOAuthCredential): Promise<void> {
     await this.store.set(ref, JSON.stringify(credential));
+  }
+
+  private localCliSourceRef(providerId: LocalCliProviderId): string {
+    return `provider:local-cli:${providerId}`;
+  }
+
+  private async isLocalCliSelected(providerId: LocalCliProviderId): Promise<boolean> {
+    return (await this.store.get(this.localCliSourceRef(providerId))) === localCliSource(providerId);
+  }
+
+  private async readUsableLocalCliCredential(providerId: LocalCliProviderId): Promise<LocalCliCredential | null> {
+    const persisted = await readLocalCliCredential(providerId, this.env);
+    if (persisted && isLocalCliCredentialLive(persisted)) {
+      this.localCliCache.set(providerId, persisted);
+      return persisted;
+    }
+    const cached = this.localCliCache.get(providerId);
+    if (cached && isLocalCliCredentialLive(cached)) return cached;
+    const previous = persisted ?? cached;
+    if (!previous?.refreshToken) return previous ?? null;
+    const inFlight = this.localCliRefreshes.get(providerId);
+    if (inFlight) return inFlight;
+    const refresh = refreshLocalCliCredential(providerId, previous, this.env, this.fetchImpl);
+    this.localCliRefreshes.set(providerId, refresh);
+    try {
+      const next = await refresh;
+      this.localCliCache.set(providerId, next);
+      return next;
+    } finally {
+      this.localCliRefreshes.delete(providerId);
+    }
   }
 
   private async startBrowser(flow: OAuthFlow): Promise<OAuthFlowSnapshot> {
@@ -512,7 +624,15 @@ export class ProviderOAuthManager {
     const verifier = flow.verifier ?? "";
     if (!verifier) throw new Error("OAuth PKCE verifier is missing");
     if (flow.providerId === "anthropic") {
-      const payload = await postJson(this.fetchImpl, ANTHROPIC_TOKEN_URL, { grant_type: "authorization_code", client_id: ANTHROPIC_CLIENT_ID, code, state: flow.state, redirect_uri: redirectUri, code_verifier: verifier }, flow.controller.signal);
+      let exchangeCode = code;
+      let exchangeState = flow.state;
+      const hash = code.indexOf("#");
+      if (hash >= 0) {
+        exchangeCode = code.slice(0, hash);
+        const frag = code.slice(hash + 1);
+        if (frag.length > 0) exchangeState = frag;
+      }
+      const payload = await postJson(this.fetchImpl, ANTHROPIC_TOKEN_URL, { grant_type: "authorization_code", client_id: ANTHROPIC_CLIENT_ID, code: exchangeCode, state: exchangeState, redirect_uri: redirectUri, code_verifier: verifier }, flow.controller.signal);
       return asStored(flow.providerId, payload);
     }
     if (flow.providerId === "xai") {

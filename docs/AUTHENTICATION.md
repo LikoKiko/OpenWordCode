@@ -4,15 +4,19 @@
 
 | Method | Providers | Behavior |
 | --- | --- | --- |
-| API key | OpenAI, Anthropic, OpenRouter, Gemini, xAI, Kimi, custom | Key is accepted by Core, encrypted at rest, and injected only into the provider request. |
-| Environment | Same cloud providers | Only the variable name is stored. The Core resolves the value at request time. |
-| None | Ollama, LM Studio, Demo | No credential is sent. Endpoint reachability is tested separately. |
+| Legacy API-key transport | Existing Core configurations only | Kept for backward compatibility; the public Word task pane no longer exposes API-key entry. |
+| Legacy environment transport | Existing Core configurations only | Only the variable name is stored. The Core resolves the value at request time; the public task pane does not expose this setup. |
+| None | Custom OpenAI-compatible endpoints | No credential is sent. Endpoint reachability is tested separately. |
 | OpenWordCode Bridge | OpenWordCode Bridge | Uses the first-party loopback compatibility API; the Bridge routes through the configured OpenWordCode provider/account runtime. |
+| Existing Codex CLI session | OpenWordCode Bridge | After the user explicitly chooses **Sign in with Codex CLI** or **Connect existing session**, Core reads the local Codex CLI session metadata/token on demand and never copies it into the OpenWordCode credential store. |
+| Existing provider CLI session | Claude, Kimi, Google Antigravity | After the user explicitly chooses the provider's CLI connector, Core reads that official CLI's local session on demand. Refreshes remain in memory; CLI credentials are never copied into OpenWordCode storage. |
 | OAuth / account sign-in | Claude, xAI, Kimi Code, Google Antigravity, GitHub Copilot, Nous Portal, and the OpenWordCode account bridge | Starts the provider's browser or device flow, exchanges the code on Core, encrypts the returned token, and refreshes it when possible. |
 
 The UI lists only methods that the provider adapter actually supports. OAuth is provider-specific: the Word pane starts sign-in, but Core owns the loopback callback/device polling and the encrypted credential. The provider password is never entered into Word. The `chatgpt.com/codex/open-app` page is not embedded in the task pane and is not treated as an authorization API; the add-in uses a normal redirect-based OAuth callback instead.
 
-The normal public setup does not require OAuth: OpenAI is selected by default and the user pastes their own API key into the task pane. The key is sent to the local Core process, stored there encrypted, and is never returned to the browser UI. OAuth is optional; select a provider and use its **Sign in** card from the task pane or Settings.
+The public setup is account-first: select the OpenWordCode Bridge and choose **Sign in with Codex CLI**, choose a provider OAuth flow, or select a local model. The Word task pane does not expose API-key entry. For ChatGPT subscription access, OpenWordCode starts the official local `codex login` flow and watches for completion; **Connect existing session** remains available after a user runs the command manually. On Windows, Core discovers the accessible per-user Codex executable automatically, and `CODEX_CLI_PATH` can override it. Core reads the official local Codex CLI session only after that explicit action; it does not scrape browser cookies or copy the token into GitHub or the OpenWordCode credential store. If Codex uses a custom `CODEX_HOME`, the Core process must inherit the same value.
+
+For provider subscription access, select Claude, Kimi, or Google Antigravity and use the matching **Sign in with … CLI** or **Connect existing … session** action. Claude Code credentials are read from `CLAUDE_CONFIG_DIR/.credentials.json` (or `~/.claude/.credentials.json`), and Kimi Code credentials are read from `KIMI_SHARE_DIR/credentials/kimi-code.json` (or `~/.kimi/credentials/kimi-code.json`). Antigravity is different: its official CLI uses the operating-system keyring, so Windows builds read the `gemini:antigravity` Credential Manager entry instead of guessing at plaintext files. The Antigravity CLI executable is `agy`; if it is not on PATH, set `ANTIGRAVITY_CLI_PATH`. These connectors do not read browser cookies, passwords, or unrelated application credentials.
 
 ## Supported provider OAuth
 
@@ -31,15 +35,33 @@ The OAuth client identifiers used for the provider flows are public-client ident
 
 The built-in callback is `http://localhost:10200/oauth/chatgpt/callback` unless `OPENWORDCODE_OPENAI_OAUTH_REDIRECT_URI` is set. The callback must be registered with the OAuth client, and the Core must be restarted after changing environment variables. The default authorization and token URLs can be overridden with `OPENWORDCODE_OPENAI_OAUTH_AUTHORIZE_URL` and `OPENWORDCODE_OPENAI_OAUTH_TOKEN_URL`; the default scope can be overridden with `OPENWORDCODE_OPENAI_OAUTH_SCOPE`.
 
-This account runtime is not the documented OpenAI Platform API. Platform API requests continue to use API keys. The account endpoint is an experimental provider integration and may change independently of the Platform API; do not ship it as a guaranteed public integration without confirming provider authorization.
+Codex, Claude Code, Kimi Code, and Antigravity CLI sessions are separate provider credentials. Connecting one never authenticates another. Antigravity remains a separate Google Cloud Code Assist provider; its CLI connector relies on the official CLI's keyring session and may be affected by Google's CLI availability, account eligibility, quota, or terms.
+
+xAI may show an authorization code in the browser instead of redirecting back to
+Word. Copy that code into the xAI sign-in panel in Settings and choose
+**Complete sign-in**. Google Antigravity browser OAuth is disabled in the public
+build when `GOOGLE_ANTIGRAVITY_CLIENT_SECRET` is not configured; use the
+Antigravity CLI connection in Settings instead.
+
+This account runtime is not the documented OpenAI Platform API. The account
+endpoint is an experimental provider integration and may change independently
+of the Platform API; do not ship it as a guaranteed public integration without
+confirming provider authorization. The public add-in intentionally does not
+offer direct API-key setup.
 
 ## Credential lifecycle
 
-1. The task pane posts an API key to the Core over the configured local origin.
-2. The Core validates it is a single-line value and stores it under `credentials.enc.json` encrypted with AES-256-GCM.
-3. `config.json` stores only `credentialRef: "provider:<id>"`.
-4. Provider adapters resolve the secret immediately before a request and never return it to the task pane.
-5. Disconnect deletes the stored entry and restores the provider's environment/no-auth mode when available.
+1. The task pane starts an account or local-CLI connection through the Core over
+   the configured local origin.
+2. OAuth credentials are stored under `credentials.enc.json` encrypted with
+   AES-256-GCM; CLI credentials remain owned by the official CLI and are read
+   only on demand.
+3. `config.json` stores provider metadata and credential references, never raw
+   account tokens.
+4. Provider adapters resolve the active account credential immediately before a
+   request and never return it to the task pane.
+5. Disconnect removes the OpenWordCode OAuth credential or local-session marker
+   and returns the provider to its sign-in-required state.
 
 For the OpenWordCode account provider, disconnect removes the encrypted OAuth credential and leaves the Bridge in its sign-in-required state. The task pane never receives the access or refresh token.
 

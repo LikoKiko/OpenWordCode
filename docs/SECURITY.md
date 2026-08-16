@@ -5,7 +5,7 @@
 - Mutating routes also require the matching CSRF header.
 - Unknown tool names and invalid tool arguments fail closed.
 - Request bodies, document context, tool results, paragraphs, and proposed changes have size limits.
-- API keys are not returned after storage; config stores references only.
+- Legacy provider credentials are not returned after storage; config stores references only. The public task pane does not accept new API keys.
 - Secrets are redacted from user-facing errors and are not logged.
 - OpenWordCode Bridge binds to loopback only. An optional `OPENWORDCODE_BRIDGE_TOKEN` protects its compatibility routes in addition to the loopback boundary.
 - Office writes require explicit approval and two stale-content checks.

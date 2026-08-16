@@ -20,6 +20,7 @@ import { buildReadOnlyContext, runAgent, type AgentRuntimeOptions } from "../../
 import { AuthManager } from "./auth.js";
 import { ChatGPTOAuthManager, OAuthConfigurationError } from "./chatgpt-auth.js";
 import { oauthProviderCatalog, oauthProviderIsSupported, ProviderOAuthManager } from "./provider-oauth.js";
+import { localCliDisplayName, localCliProviderIsSupported } from "./local-cli-auth.js";
 import { ChangeStore, StaleChangeError } from "./changes.js";
 import { AgentActionStore } from "./actions.js";
 import { executeConsoleCommand, validateConsoleCommand } from "./console.js";
@@ -94,6 +95,18 @@ const attachmentsSchema = z.array(attachmentSchema).max(4).superRefine((files, c
   if (files.reduce((total, file) => total + file.size, 0) > 12_000_000) context.addIssue({ code: z.ZodIssueCode.custom, message: "attachments exceed the 12 MB total limit" });
 });
 
+const skillSchema = z.object({
+  id: z.string().min(1).max(120),
+  name: z.string().min(1).max(120),
+  description: z.string().max(500).optional().default(""),
+  instructions: z.string().min(1).max(30_000),
+  isDefault: z.boolean().optional(),
+  enabled: z.boolean().optional(),
+  author: z.string().max(120).optional(),
+  version: z.string().max(40).optional(),
+});
+const skillsSchema = z.array(skillSchema).max(12);
+
 const agentSchema = z.object({
   providerId: bodyProviderId,
   modelId: z.string().trim().min(1).max(200),
@@ -102,12 +115,12 @@ const agentSchema = z.object({
   document: documentSchema,
   attachments: attachmentsSchema.optional(),
   conversation: z.array(z.object({ role: z.enum(["system", "user", "assistant", "tool"]), content: z.string().max(20_000), toolCallId: z.string().max(200).optional() })).max(12).optional(),
+  skills: skillsSchema.optional(),
   tools: z.object({ webSearch: z.boolean().optional(), console: z.boolean().optional() }).strict().optional(),
 });
 
-const apiKeySchema = z.object({ key: z.string().trim().min(1).max(4_096), label: z.string().trim().max(120).optional() });
-const authMethodSchema = z.object({ method: z.enum(["api-key", "environment", "none", "existing-session", "oauth"]), envVar: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).optional() });
-const customProviderSchema = z.object({ id: z.string().trim().regex(/^[a-z0-9][a-z0-9._-]{1,60}$/), displayName: z.string().trim().min(1).max(120), baseUrl: z.string().url(), authMethod: z.enum(["api-key", "environment", "none"]).default("api-key"), envVar: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).optional(), defaultModel: z.string().trim().max(200).optional(), privacyNote: z.string().trim().max(500).optional() });
+const authMethodSchema = z.object({ method: z.enum(["environment", "none", "existing-session", "oauth"]), envVar: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).optional() });
+const customProviderSchema = z.object({ id: z.string().trim().regex(/^[a-z0-9][a-z0-9._-]{1,60}$/), displayName: z.string().trim().min(1).max(120), baseUrl: z.string().url(), authMethod: z.enum(["environment", "none"]).default("none"), envVar: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).optional(), defaultModel: z.string().trim().max(200).optional(), privacyNote: z.string().trim().max(500).optional() });
 const settingsPatchSchema = z.object({ selectedProviderId: z.string().min(1).max(80).optional(), selectedModelId: z.string().max(200).optional(), mode: z.enum(["manual", "auto", "skip"]).optional(), theme: z.enum(["light", "dark", "system"]).optional() }).strict();
 
 class ApiError extends Error {
@@ -180,6 +193,7 @@ function providerAuthDto(provider: ProviderConfig, auth: Awaited<ReturnType<Auth
       availableMethods: auth.availableMethods,
       credentialConfigured: auth.credentialConfigured,
       environmentConfigured: auth.environmentConfigured,
+      ...(auth.source ? { source: auth.source } : {}),
     },
   };
 }
@@ -265,6 +279,25 @@ export async function buildServer(state = createCoreState()): Promise<FastifyIns
       throw error;
     }
   });
+  app.post("/api/auth/chatgpt/start-codex-cli-login", async () => {
+    try {
+      const launch = await state.chatGptAuth.startCodexCliLogin();
+      return { ok: true, ...launch };
+    } catch (error) {
+      if (error instanceof OAuthConfigurationError) throw new ApiError(409, "codex_cli_unavailable", error.message);
+      throw error;
+    }
+  });
+  app.post("/api/auth/chatgpt/use-codex-cli", async () => {
+    try {
+      await state.chatGptAuth.useCodexCli();
+      const provider = requireProvider(state, "openwordcode-bridge");
+      return { ok: true, auth: await state.auth.status(provider) };
+    } catch (error) {
+      if (error instanceof OAuthConfigurationError) throw new ApiError(409, "codex_cli_session_unavailable", error.message);
+      throw error;
+    }
+  });
   app.get<{ Querystring: { flowId?: string } }>("/api/auth/chatgpt/status", async request => {
     const flowId = request.query.flowId?.trim();
     if (!flowId) throw new ApiError(400, "flow_id_required", "OAuth flow id is required");
@@ -284,6 +317,36 @@ export async function buildServer(state = createCoreState()): Promise<FastifyIns
   });
 
   app.get("/api/oauth/providers", async () => ({ providers: oauthProviderCatalog() }));
+  app.post<{ Params: { provider: string } }>("/api/oauth/:provider/local-cli/start", async request => {
+    const providerId = request.params.provider.trim();
+    if (!localCliProviderIsSupported(providerId)) throw new ApiError(409, "local_cli_unavailable", `No supported local CLI connector is available for ${providerId}.`);
+    const provider = Object.values(state.settings.providers).find(item => item.auth.oauthProvider === providerId && item.enabled);
+    if (!provider) throw new ApiError(404, "oauth_provider_not_found", `No enabled provider is configured for ${providerId}.`);
+    try {
+      const launch = await state.providerOAuth.startLocalCliLogin(providerId);
+      const next = state.auth.activateOAuth(provider);
+      state.settings = updateProvider(state.settings, next);
+      saveState(state);
+      return { ok: true, ...launch, auth: await state.auth.status(next) };
+    } catch (error) {
+      throw new ApiError(409, "local_cli_start_failed", error instanceof Error ? error.message : `${localCliDisplayName(providerId)} login could not be started`);
+    }
+  });
+  app.post<{ Params: { provider: string } }>("/api/oauth/:provider/local-cli/use", async request => {
+    const providerId = request.params.provider.trim();
+    if (!localCliProviderIsSupported(providerId)) throw new ApiError(409, "local_cli_unavailable", `No supported local CLI connector is available for ${providerId}.`);
+    const provider = Object.values(state.settings.providers).find(item => item.auth.oauthProvider === providerId && item.enabled);
+    if (!provider) throw new ApiError(404, "oauth_provider_not_found", `No enabled provider is configured for ${providerId}.`);
+    try {
+      await state.providerOAuth.useLocalCli(providerId);
+      const next = state.auth.activateOAuth(provider);
+      state.settings = updateProvider(state.settings, next);
+      saveState(state);
+      return { ok: true, auth: await state.auth.status(next) };
+    } catch (error) {
+      throw new ApiError(409, "local_cli_session_unavailable", error instanceof Error ? error.message : `No active ${localCliDisplayName(providerId)} session was found`);
+    }
+  });
   app.post<{ Params: { provider: string } }>("/api/oauth/:provider/start", async request => {
     const providerId = request.params.provider.trim();
     const entry = oauthProviderCatalog().find(item => item.id === providerId);
@@ -307,6 +370,22 @@ export async function buildServer(state = createCoreState()): Promise<FastifyIns
     }
     return snapshot;
   });
+  app.post<{ Params: { flowId: string } }>("/api/oauth/flows/:flowId/complete", async request => {
+    const body = requireBody(z.object({ code: z.string().trim().min(1).max(4_096) }), request.body);
+    try {
+      const snapshot = await state.providerOAuth.completeManualCode(request.params.flowId.trim(), body.code);
+      if (snapshot.status === "connected") {
+        const provider = Object.values(state.settings.providers).find(item => item.auth.oauthProvider === snapshot.providerId && item.enabled);
+        if (provider && provider.auth.method !== "oauth") {
+          state.settings = updateProvider(state.settings, state.auth.activateOAuth(provider));
+          saveState(state);
+        }
+      }
+      return snapshot;
+    } catch (error) {
+      throw new ApiError(409, "oauth_code_exchange_failed", error instanceof Error ? error.message : "Could not complete sign-in");
+    }
+  });
   app.post("/api/oauth/flows/cancel", async request => {
     const body = requireBody(z.object({ flowId: z.string().trim().min(1).max(120) }), request.body);
     state.providerOAuth.cancel(body.flowId);
@@ -325,7 +404,7 @@ export async function buildServer(state = createCoreState()): Promise<FastifyIns
     if (state.settings.providers[body.id]) throw new ApiError(409, "provider_exists", "A provider with this id already exists");
     const parsedUrl = new URL(body.baseUrl);
     if (!["http:", "https:"].includes(parsedUrl.protocol)) throw new ApiError(400, "invalid_provider_url", "Provider URL must use HTTP or HTTPS");
-    const authMethod = body.authMethod ?? "api-key";
+    const authMethod = body.authMethod ?? "none";
     const provider: ProviderConfig = {
       id: body.id,
       displayName: body.displayName,
@@ -356,20 +435,12 @@ export async function buildServer(state = createCoreState()): Promise<FastifyIns
     const started = Date.now();
     try { const models = await runtime.listModels(); return { ok: true, providerId: id, modelCount: models.length, durationMs: Date.now() - started }; } catch (error) { throw new ApiError(502, "provider_test_failed", providerErrorDetail(error)); }
   });
-  app.post<{ Params: { id: string } }>("/api/providers/:id/credentials", async request => {
-    const id = providerIdFromRequest(request);
-    const body = requireBody(apiKeySchema, request.body);
-    const provider = requireProvider(state, id);
-    const next = await state.auth.configureApiKey(provider, body.key, body.label);
-    state.settings = updateProvider(state.settings, next);
-    saveState(state);
-    return { ok: true, providerId: id, auth: await state.auth.status(next) };
-  });
   app.put<{ Params: { id: string } }>("/api/providers/:id/auth", async request => {
     const id = providerIdFromRequest(request);
     const body = requireBody(authMethodSchema, request.body);
     const provider = requireProvider(state, id);
     const next = state.auth.setMethod(provider, body.method, body.envVar);
+    if (body.method !== "oauth" && provider.auth.oauthProvider) await state.providerOAuth.clearLocalCli(provider.auth.oauthProvider);
     state.settings = updateProvider(state.settings, next);
     saveState(state);
     return { ok: true, providerId: id, auth: await state.auth.status(next) };
@@ -450,6 +521,7 @@ export async function buildServer(state = createCoreState()): Promise<FastifyIns
         document,
         attachments: body.attachments,
         conversation: body.conversation,
+        skills: body.skills,
         webSearchEnabled: body.tools?.webSearch === true,
         consoleEnabled: body.tools?.console === true,
         searchWeb: body.tools?.webSearch === true && bridgeProvider

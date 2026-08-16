@@ -19,6 +19,7 @@ import {
   type DocumentSnapshot,
   type DocumentTarget,
   type ProposedChange,
+  type SkillSummary,
   type WordRangeOperation,
   textFingerprint,
   visualElementTargetText,
@@ -303,6 +304,7 @@ export interface AgentRuntimeOptions {
   document: DocumentSnapshot;
   attachments?: ChatAttachment[];
   conversation?: ChatMessage[];
+  skills?: SkillSummary[];
   webSearchEnabled?: boolean;
   consoleEnabled?: boolean;
   searchWeb?: (query: string) => Promise<string>;
@@ -516,6 +518,12 @@ function requestsDocumentChange(instruction: string): boolean {
   return /(edit|change|rewrite|reword|replace|delete|remove|erase|clear|insert|add|create|write|draft|format|style|fill|number|label|table|comment|bold|italic|highlight|crop|resize|rotate|flip|move|wrap|alt\s*text|ערוך|שנה|נסח|החלף|מחק|הסר|נקה|הוסף|הכנס|צור|כתוב|טיוטה|עצב|מלא|מספר|תווית|טבלה|הערה|מודגש|חתוך|שנה גודל|סובב|הזז|תמונה)/iu.test(instruction);
 }
 
+function requestsDocumentContext(instruction: string, options: AgentRuntimeOptions): boolean {
+  if (options.attachments?.length || options.webSearchEnabled || options.consoleEnabled) return true;
+  if (requestsDocumentChange(instruction)) return true;
+  return /(document|docx|word|selection|selected|paragraph|table|image|picture|photo|shape|page|file|contract|report|clause|section|text|review|summarize|summary|analy[sz]e|proofread|grammar|typo|מסמך|וורד|בחירה|פסקה|טבלה|תמונה|קובץ|עמוד|סיכום|בדוק|דקדוק)/iu.test(instruction);
+}
+
 function repairDocumentChangePrompt(instruction: string): string {
   const wholeDocument = requestsWholeDocumentReplacement(instruction);
   return `The user requested a real Microsoft Word edit: ${instruction}\n\nYour previous response did not contain a valid proposed document change. Return JSON only with this shape: {"answer":"brief description","proposedChanges":[{"type":"replace_text"|"insert_text"|"range_operation","targetId":"selection"|"document"|"paragraph-id"|"inline-picture-id"|"shape-id","after":"complete generated replacement or inserted content","operation":{"name":"known mutating operation","args":[],"scope":"range"|"table"|"image"|"shape"},"description":"what will change"}]}\n\n${wholeDocument ? "IMPORTANT: The user asked to replace the whole document. Use targetId \"document\", put the exact current DOCUMENT_TEXT in before, and put the complete new document in after. Do not target one paragraph or the current selection." : "Use targetId \"selection\" for the current selection, \"document\" only when the user asked to change the entire document, a paragraph id for text, and the exact visual id from DOCUMENT_VISUAL_ELEMENTS for a picture or floating shape."} Omit before for visual targets. For formatting, tables, comments, deletion, and structured edits use range_operation. For pictures and shapes use only the advertised image/shape operations. Do not say that you edited Word unless you return a proposal; the host will execute it and report success.`;
@@ -639,7 +647,10 @@ export async function runAgent(options: AgentRuntimeOptions): Promise<AgentResul
     return { answer: directVisualPlan.answer, changes: [directVisualPlan.change], actions: [], truncated: false };
   }
   const tools = documentTools(options);
-  const toolDefinitions = tools.map(tool => tool.definition);
+  // Greetings and ordinary conversation must not expose the Word tools. Some
+  // providers otherwise interpret the large document context as an invitation
+  // to repeatedly call get_selection/get_document_text before answering "hi".
+  const toolDefinitions = requestsDocumentContext(options.instruction, options) ? tools.map(tool => tool.definition) : [];
   const providerAttachments = [...embeddedVisualAttachments(options.document), ...(options.attachments ?? [])].slice(0, 8);
   const changes: ProposedChange[] = [];
   const actions: AgentAction[] = [];
@@ -653,14 +664,19 @@ export async function runAgent(options: AgentRuntimeOptions): Promise<AgentResul
       options.onEvent?.({ type: "action", action });
     },
   };
+  const activeSkills = (options.skills ?? []).filter(skill => skill.enabled !== false);
+  const skillsContext = activeSkills.length
+    ? `\n\nActive AI Skills (pre-packaged specialized prompt instructions & recipes loaded for this document task):\n${activeSkills.map(skill => `--- SKILL: ${skill.name} ---\n${skill.description ? `Description: ${skill.description}\n` : ""}Instructions:\n${skill.instructions}`).join("\n\n")}`
+    : "";
   const messages: ChatMessage[] = [
-    { role: "system", content: WORD_AGENT_RUNTIME_CONTEXT },
+    { role: "system", content: `${WORD_AGENT_RUNTIME_CONTEXT}${skillsContext}` },
     ...(options.conversation ?? []).slice(-8),
     { role: "user", content: contextPrompt(options.document, options.instruction, options.attachments) },
   ];
-  const maxIterations = options.maxIterations ?? 8;
+  const maxIterations = options.maxIterations ?? 10;
   const maxToolCalls = options.maxToolCalls ?? 16;
   let toolCallsUsed = 0;
+  let toolLimitReached = false;
   let finalText = "";
   let truncated = options.document.truncated === true;
 
@@ -670,7 +686,7 @@ export async function runAgent(options: AgentRuntimeOptions): Promise<AgentResul
     const returnedTools: ToolCall[] = [];
     let pendingDisplay = "";
     let displayStarted = false;
-    for await (const event of options.provider.streamChat({ model: options.modelId, messages, tools: toolDefinitions, signal: options.signal, ...(providerAttachments.length ? { attachments: providerAttachments } : {}) })) {
+    for await (const event of options.provider.streamChat({ model: options.modelId, messages, tools: toolLimitReached ? [] : toolDefinitions, signal: options.signal, ...(providerAttachments.length ? { attachments: providerAttachments } : {}) })) {
       if (event.type === "text") {
         assistantText += event.delta;
         pendingDisplay += event.delta;
@@ -687,11 +703,12 @@ export async function runAgent(options: AgentRuntimeOptions): Promise<AgentResul
     if (returnedTools.length > 0) {
       messages.push({ role: "assistant", content: assistantText, toolCalls: returnedTools });
       for (const call of returnedTools) {
-        toolCallsUsed += 1;
-        if (toolCallsUsed > maxToolCalls) {
+        if (!toolDefinitions.length || toolLimitReached || toolCallsUsed >= maxToolCalls) {
           messages.push({ role: "tool", toolCallId: call.id, content: JSON.stringify({ error: "tool call limit reached" }) });
+          toolLimitReached = true;
           continue;
         }
+        toolCallsUsed += 1;
         const tool = toolByName(tools, call.name);
         options.onEvent?.({ type: "tool", name: call.name, state: "started" });
         if (!tool) {
@@ -704,7 +721,9 @@ export async function runAgent(options: AgentRuntimeOptions): Promise<AgentResul
         const result = await tool.execute(args, context);
         messages.push({ role: "tool", toolCallId: call.id, content: result });
         options.onEvent?.({ type: "tool", name: call.name, state: "completed" });
+        if (toolCallsUsed >= maxToolCalls) toolLimitReached = true;
       }
+      if (toolLimitReached) messages.push({ role: "user", content: "The safe tool-call budget is exhausted. Do not call any more tools. Give the user the best concise final answer based on the information already available; if the request could not be completed, say exactly what is missing." });
       continue;
     }
     if (!displayStarted && pendingDisplay) {

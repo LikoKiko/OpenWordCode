@@ -1,6 +1,6 @@
 import { type CredentialStore } from "../../../packages/auth/src/index.js";
 import { type AuthMethod, type ProviderAuthInfo, type ProviderConfig } from "../../../packages/shared/src/index.js";
-import { providerAuthUsesSecret, type ProviderOAuthCredential } from "../../../packages/providers/src/index.js";
+import { type ProviderOAuthCredential } from "../../../packages/providers/src/index.js";
 import { type ChatGPTOAuthStatus, ChatGPTOAuthManager, OPENWORDCODE_ACCOUNT_CREDENTIAL_REF } from "./chatgpt-auth.js";
 import { oauthProviderIsSupported, ProviderOAuthManager, type OAuthStatus } from "./provider-oauth.js";
 
@@ -46,7 +46,7 @@ export class AuthManager {
       return {
         status: stored ? "connected" : "login-required",
         method: provider.auth.method,
-        detail: stored ? "API key stored in the Core credential store" : "Add an API key to connect",
+        detail: stored ? "Legacy provider credential is configured" : "This provider needs a supported account connection or local runtime",
         availableMethods,
         credentialConfigured: stored,
         environmentConfigured: envConfigured,
@@ -82,6 +82,7 @@ export class AuthManager {
   async configureApiKey(provider: ProviderConfig, key: string, _label?: string): Promise<ProviderConfig> {
     const credentialRef = provider.auth.credentialRef ?? `provider:${provider.id}`;
     await this.store.set(credentialRef, key.trim());
+    if (provider.auth.oauthProvider) await this.providerOAuth?.clearLocalCli(provider.auth.oauthProvider);
     return {
       ...provider,
       auth: {
@@ -164,9 +165,7 @@ export class AuthManager {
     if (isOpenWordCodeAccountProvider(provider)) return ["oauth"];
     if (provider.kind === "demo") return ["none"];
     if (provider.local) return ["none"];
-    const methods: AuthMethod[] = providerAuthUsesSecret(provider) ? ["environment", "api-key"] : ["api-key", "environment"];
-    if (provider.auth.oauthProvider) methods.push("oauth");
-    return [...new Set(methods)];
+    return provider.auth.oauthProvider && oauthProviderIsSupported(provider.auth.oauthProvider) ? ["oauth"] : [];
   }
 }
 
@@ -182,6 +181,7 @@ function oauthAuthInfo(oauth: ChatGPTOAuthStatus | OAuthStatus, availableMethods
     availableMethods,
     credentialConfigured: oauth.credentialConfigured,
     environmentConfigured: false,
+    ...(oauth.source ? { source: oauth.source } : {}),
   };
 }
 

@@ -1,12 +1,25 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createServer, type Server } from "node:http";
 import { type CredentialStore } from "../../../packages/auth/src/index.js";
+import {
+  isCodexCliCredentialLive,
+  launchCodexCliLogin,
+  readCodexCliCredential,
+  refreshCodexCliSession,
+  type CodexCliCredential,
+  type CodexCliLoginLaunch,
+} from "./codex-cli-auth.js";
 
+const DEFAULT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize";
 const DEFAULT_TOKEN_URL = "https://auth.openai.com/oauth/token";
-const DEFAULT_SCOPE = "openid profile email offline_access";
-const DEFAULT_PORT = 10_200;
+const DEFAULT_SCOPE = "openid profile email offline_access api.connectors.read api.connectors.invoke";
+const CALLBACK_PORT = 1455;
+const CALLBACK_PATH = "/auth/callback";
 const CREDENTIAL_REF = "provider:openwordcode-account";
 const FLOW_TTL_MS = 10 * 60 * 1_000;
+const CODEX_CLI_SOURCE_REF = "provider:openwordcode-account:codex-cli";
+const CODEX_CLI_SOURCE = "codex-cli";
 
 export interface OAuthProviderCredential {
   accessToken: string;
@@ -28,6 +41,7 @@ interface PendingFlow {
   createdAt: number;
   status: "pending" | "connected" | "error";
   detail?: string;
+  server?: Server;
 }
 
 export type ChatGPTOAuthFlowStatus = "pending" | "connected" | "error";
@@ -37,6 +51,7 @@ export interface ChatGPTOAuthStatus {
   detail: string;
   credentialConfigured: boolean;
   configured: boolean;
+  source?: "openwordcode-account" | "codex-cli";
   email?: string;
 }
 
@@ -159,18 +174,19 @@ function localRedirectUri(value: string): string {
 export class ChatGPTOAuthManager {
   private readonly flows = new Map<string, PendingFlow>();
   private refreshPromise: Promise<OAuthProviderCredential> | null = null;
+  private codexCliRefreshPromise: Promise<CodexCliCredential | null> | null = null;
 
   constructor(private readonly store: CredentialStore, private readonly env: NodeJS.ProcessEnv = process.env) {}
 
   private clientId(): string | undefined {
     return this.env.OPENWORDCODE_OPENAI_OAUTH_CLIENT_ID?.trim()
-      || this.env.OPENWORDCODE_CHATGPT_OAUTH_CLIENT_ID?.trim();
+      || this.env.OPENWORDCODE_CHATGPT_OAUTH_CLIENT_ID?.trim()
+      || DEFAULT_CLIENT_ID;
   }
 
   private redirectUri(): string {
     const configured = this.env.OPENWORDCODE_OPENAI_OAUTH_REDIRECT_URI?.trim();
-    const port = Number(this.env.OPENWORDCODE_PORT ?? DEFAULT_PORT) || DEFAULT_PORT;
-    return localRedirectUri(configured || `http://localhost:${port}/oauth/chatgpt/callback`);
+    return localRedirectUri(configured || `http://localhost:${CALLBACK_PORT}${CALLBACK_PATH}`);
   }
 
   private authorizeUrl(): string {
@@ -191,21 +207,46 @@ export class ChatGPTOAuthManager {
 
   async status(credentialRef = CREDENTIAL_REF): Promise<ChatGPTOAuthStatus> {
     const configured = this.isConfigured();
+    if (await this.isCodexCliSelected()) {
+      const credential = await readCodexCliCredential(this.env);
+      if (!credential) return { status: "login-required", detail: "Sign in with the Codex CLI, then connect the session here.", credentialConfigured: true, configured: true, source: "codex-cli" };
+      if (!isCodexCliCredentialLive(credential)) return { status: "expired", detail: "The Codex CLI session has expired. Sign in again with the Codex CLI, then connect it here.", credentialConfigured: true, configured: true, source: "codex-cli", ...(credential.email ? { email: credential.email } : {}) };
+      return { status: "connected", detail: credential.email ? `Using your Codex CLI session (${credential.email})` : "Using your Codex CLI session", credentialConfigured: true, configured: true, source: "codex-cli", ...(credential.email ? { email: credential.email } : {}) };
+    }
     const credential = parseStoredCredential(await this.store.get(credentialRef));
     if (!configured) {
       return {
         status: "unsupported",
-        detail: "OpenWordCode account sign-in is not configured for this build. Set an app-owned OAuth client id in the Core environment.",
+        detail: "Direct OpenWordCode account sign-in is not configured for this build. Use the signed-in Codex CLI session or configure an app-owned OAuth client.",
         credentialConfigured: Boolean(credential),
         configured: false,
+        source: "openwordcode-account",
         ...(credential?.email ? { email: credential.email } : {}),
       };
     }
-    if (!credential) return { status: "login-required", detail: "Sign in to your OpenWordCode account to use the Bridge.", credentialConfigured: false, configured: true };
+    if (!credential) return { status: "login-required", detail: "Sign in to your OpenWordCode account or use your signed-in Codex CLI session.", credentialConfigured: false, configured: true, source: "openwordcode-account" };
     if (credential.expiresAt !== undefined && credential.expiresAt <= Date.now() && !credential.refreshToken) {
-      return { status: "expired", detail: "The OpenWordCode account sign-in expired. Sign in again to reconnect.", credentialConfigured: true, configured: true, ...(credential.email ? { email: credential.email } : {}) };
+      return { status: "expired", detail: "The OpenWordCode account sign-in expired. Sign in again to reconnect.", credentialConfigured: true, configured: true, source: "openwordcode-account", ...(credential.email ? { email: credential.email } : {}) };
     }
-    return { status: "connected", detail: credential.email ? `Signed in as ${credential.email}` : "OpenWordCode account connected", credentialConfigured: true, configured: true, ...(credential.email ? { email: credential.email } : {}) };
+    return { status: "connected", detail: credential.email ? `Signed in as ${credential.email}` : "OpenWordCode account connected", credentialConfigured: true, configured: true, source: "openwordcode-account", ...(credential.email ? { email: credential.email } : {}) };
+  }
+
+  async startCodexCliLogin(): Promise<CodexCliLoginLaunch> {
+    let launch: CodexCliLoginLaunch;
+    try {
+      launch = await launchCodexCliLogin(this.env);
+    } catch (error) {
+      throw new OAuthConfigurationError(error instanceof Error ? error.message : "The Codex CLI login could not be started.");
+    }
+    await this.store.set(CODEX_CLI_SOURCE_REF, CODEX_CLI_SOURCE);
+    return launch;
+  }
+
+  async useCodexCli(): Promise<void> {
+    const credential = await this.readUsableCodexCliCredential();
+    if (!credential) throw new OAuthConfigurationError("No signed-in Codex CLI session was found. Click `Sign in with Codex CLI`, complete the browser login, then connect the session here.");
+    if (!isCodexCliCredentialLive(credential)) throw new OAuthConfigurationError("The Codex CLI session is expired or its refresh token is invalid. Sign in again with the Codex CLI, then connect the session here.");
+    await this.store.set(CODEX_CLI_SOURCE_REF, CODEX_CLI_SOURCE);
   }
 
   start(): ChatGPTOAuthStart {
@@ -223,9 +264,66 @@ export class ChatGPTOAuthManager {
       code_challenge: createChallenge(verifier),
       code_challenge_method: "S256",
       state,
+      id_token_add_organizations: "true",
+      codex_cli_simplified_flow: "true",
+      originator: "openwordcode",
       prompt: "login",
     });
     const flow: PendingFlow = { id: flowId, state, verifier, createdAt: Date.now(), status: "pending" };
+    if (redirectUri.includes(`:${CALLBACK_PORT}`)) {
+      const server = createServer((req, res) => {
+        const url = new URL(req.url ?? "/", `http://localhost:${CALLBACK_PORT}`);
+        if (url.pathname !== CALLBACK_PATH) {
+          res.statusCode = 404;
+          res.end("Not found");
+          return;
+        }
+        const code = url.searchParams.get("code");
+        const returnedState = url.searchParams.get("state");
+        const error = url.searchParams.get("error");
+        const errorDescription = url.searchParams.get("error_description");
+        if (returnedState !== flow.state) {
+          flow.status = "error";
+          flow.detail = "State mismatch. Please try signing in again.";
+          res.statusCode = 400;
+          res.setHeader("Content-Type", "text/html; charset=utf-8");
+          res.end(`<h2>Login failed</h2><p>${flow.detail}</p>`);
+          try { server.close(); } catch {}
+          return;
+        }
+        if (error || !code) {
+          flow.status = "error";
+          flow.detail = errorDescription || error || "Sign-in failed";
+          res.statusCode = 400;
+          res.setHeader("Content-Type", "text/html; charset=utf-8");
+          res.end(`<h2>Login failed</h2><p>${flow.detail}</p>`);
+          try { server.close(); } catch {}
+          return;
+        }
+        void (async () => {
+          try {
+            const credential = await this.exchangeCode(code, flow.verifier);
+            await this.storeCredential(credential);
+            flow.status = "connected";
+            flow.detail = credential.email ? `Signed in as ${credential.email}` : "ChatGPT account connected.";
+            res.statusCode = 200;
+            res.setHeader("Content-Type", "text/html; charset=utf-8");
+            res.end("<!doctype html><html><head><meta charset='utf-8'><title>OpenWordCode</title></head><body style='font-family:system-ui,sans-serif;text-align:center;padding:4rem;color:#111'><h2>&#9989; Login complete</h2><p>You can close this tab and return to Microsoft Word.</p></body></html>");
+          } catch (err) {
+            flow.status = "error";
+            flow.detail = safeError(err);
+            res.statusCode = 500;
+            res.setHeader("Content-Type", "text/html; charset=utf-8");
+            res.end(`<h2>Login failed</h2><p>${flow.detail}</p>`);
+          } finally {
+            try { server.close(); } catch {}
+          }
+        })();
+      });
+      flow.server = server;
+      server.once("error", () => { /* port in use or conflict, will fallback to manual or existing server */ });
+      try { server.listen(CALLBACK_PORT, "127.0.0.1"); } catch {}
+    }
     this.pruneFlows();
     this.flows.set(flowId, flow);
     return { flowId, authorizeUrl: `${this.authorizeUrl()}?${params.toString()}`, redirectUri, expiresAt: new Date(flow.createdAt + FLOW_TTL_MS).toISOString() };
@@ -240,6 +338,10 @@ export class ChatGPTOAuthManager {
   }
 
   cancel(flowId: string): void {
+    const flow = this.flows.get(flowId);
+    if (flow?.server) {
+      try { flow.server.close(); } catch {}
+    }
     this.flows.delete(flowId);
   }
 
@@ -271,9 +373,15 @@ export class ChatGPTOAuthManager {
 
   async disconnect(credentialRef = CREDENTIAL_REF): Promise<void> {
     await this.store.remove(credentialRef);
+    await this.store.remove(CODEX_CLI_SOURCE_REF);
   }
 
   async resolve(credentialRef = CREDENTIAL_REF): Promise<OAuthProviderCredential | null> {
+    if (await this.isCodexCliSelected()) {
+      const credential = await this.readUsableCodexCliCredential();
+      if (!credential || !isCodexCliCredentialLive(credential)) return null;
+      return { accessToken: credential.accessToken, ...(credential.accountId ? { accountId: credential.accountId } : {}) };
+    }
     const stored = parseStoredCredential(await this.store.get(credentialRef));
     if (!stored) return null;
     if (stored.expiresAt === undefined || stored.expiresAt > Date.now() + 60_000) return { accessToken: stored.accessToken, ...(stored.accountId ? { accountId: stored.accountId } : {}) };
@@ -333,6 +441,22 @@ export class ChatGPTOAuthManager {
 
   private async storeCredential(value: StoredOAuthCredential): Promise<void> {
     await this.store.set(CREDENTIAL_REF, JSON.stringify(value));
+  }
+
+  private async readUsableCodexCliCredential(): Promise<CodexCliCredential | null> {
+    const credential = await readCodexCliCredential(this.env);
+    if (!credential || isCodexCliCredentialLive(credential)) return credential;
+    if (!this.codexCliRefreshPromise) {
+      this.codexCliRefreshPromise = (async () => {
+        await refreshCodexCliSession(this.env);
+        return readCodexCliCredential(this.env);
+      })().finally(() => { this.codexCliRefreshPromise = null; });
+    }
+    return this.codexCliRefreshPromise;
+  }
+
+  private async isCodexCliSelected(): Promise<boolean> {
+    return (await this.store.get(CODEX_CLI_SOURCE_REF)) === CODEX_CLI_SOURCE;
   }
 
   private pruneFlows(): void {

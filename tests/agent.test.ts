@@ -28,6 +28,17 @@ class ScriptedProvider implements ProviderRuntime {
   }
 }
 
+class GreetingProvider implements ProviderRuntime {
+  readonly config = { id: "greeting-test", displayName: "Greeting Test", kind: "demo" as const, baseUrl: "demo://greeting-test", enabled: true, local: true, auth: { method: "none" as const }, privacyNote: "test" };
+  toolCount = -1;
+  async listModels() { return []; }
+  async *streamChat(request: ProviderChatRequest): AsyncGenerator<ProviderStreamEvent> {
+    this.toolCount = request.tools?.length ?? 0;
+    yield { type: "text", delta: "Hi! How can I help with your Word document?" };
+    yield { type: "done" };
+  }
+}
+
 class RangeScriptedProvider implements ProviderRuntime {
   readonly config = { id: "range-test", displayName: "Range Test", kind: "demo" as const, baseUrl: "demo://range-test", enabled: true, local: true, auth: { method: "none" as const }, privacyNote: "test" };
   async listModels() { return []; }
@@ -80,6 +91,13 @@ describe("agent runtime", () => {
     expect(result.changes).toHaveLength(1);
     expect(result.changes[0]?.status).toBe("pending");
     expect(result.changes[0]?.after).toBe("The customer needs to submit the form.");
+  });
+
+  it("does not expose document tools for ordinary conversation", async () => {
+    const provider = new GreetingProvider();
+    const result = await runAgent({ provider, modelId: "test", instruction: "hi", mode: "manual", document });
+    expect(provider.toolCount).toBe(0);
+    expect(result.answer).toBe("Hi! How can I help with your Word document?");
   });
 
   it("keeps manual approval changes pending", async () => {

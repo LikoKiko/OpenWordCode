@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { MemoryCredentialStore } from "../packages/auth/src/index.js";
 import { ChatGPTOAuthManager } from "../apps/core/src/chatgpt-auth.js";
 
@@ -27,6 +30,25 @@ describe("ChatGPT OAuth manager", () => {
       expect(stored).toContain("refresh-token");
     } finally {
       vi.unstubAllGlobals();
+    }
+  });
+
+  it("uses an explicitly selected local Codex CLI session without copying its token", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "openwordcode-codex-cli-"));
+    const payload = Buffer.from(JSON.stringify({ email: "cli@example.com", exp: Math.floor(Date.now() / 1_000) + 3_600 })).toString("base64url");
+    const accessToken = `header.${payload}.signature`;
+    await writeFile(join(directory, "auth.json"), JSON.stringify({ tokens: { access_token: accessToken, account_id: "acct-cli" } }));
+    const store = new MemoryCredentialStore();
+    const manager = new ChatGPTOAuthManager(store, { CODEX_HOME: directory });
+    try {
+      await manager.useCodexCli();
+      expect((await manager.status()).source).toBe("codex-cli");
+      expect((await manager.status()).detail).toContain("cli@example.com");
+      expect(await manager.resolve()).toEqual({ accessToken, accountId: "acct-cli" });
+      expect(await store.get("provider:openwordcode-account")).toBeNull();
+      expect(await store.get("provider:openwordcode-account:codex-cli")).toBe("codex-cli");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
     }
   });
 });

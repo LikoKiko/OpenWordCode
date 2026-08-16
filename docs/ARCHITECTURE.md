@@ -33,6 +33,6 @@ The Core starts the first-party OpenWordCode Bridge alongside the task-pane serv
 
 ## Configuration and secrets
 
-Configuration is stored under the platform config directory, or `OPENWORDCODE_DATA_DIR` when set. Provider config stores a credential reference or environment variable name, never the raw API key. The fallback store encrypts secrets with AES-256-GCM and keeps the key in a separate permission-hardened file. A native Windows Credential Manager/macOS Keychain implementation can replace that class behind the `CredentialStore` interface.
+Configuration is stored under the platform config directory, or `OPENWORDCODE_DATA_DIR` when set. Provider config stores a credential reference or environment variable name, never a raw secret. The public Word task pane does not accept new API keys; legacy Core configurations remain readable for compatibility. The fallback store encrypts secrets with AES-256-GCM and keeps the key in a separate permission-hardened file. A native Windows Credential Manager/macOS Keychain implementation can replace that class behind the `CredentialStore` interface.
 
 The server binds to `127.0.0.1` and requires a short-lived-process session token on protected routes, with an additional CSRF header on mutations.

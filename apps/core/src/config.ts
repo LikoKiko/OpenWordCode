@@ -16,7 +16,7 @@ const authSchema = z.object({
 const providerSchema = z.object({
   id: z.string().min(1).max(80),
   displayName: z.string().min(1).max(120),
-  kind: z.enum(["openai-compatible", "openwordcode-bridge", "openai-codex", "anthropic", "gemini", "google-antigravity", "ollama", "lm-studio", "demo"]),
+  kind: z.enum(["openai-compatible", "openwordcode-bridge", "openai-codex", "anthropic", "gemini", "google-antigravity", "demo"]),
   baseUrl: z.string().url(),
   enabled: z.boolean(),
   local: z.boolean(),
@@ -50,15 +50,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/**
- * Convert the old external OpenCodex provider to the first-party bridge once.
- * The migration intentionally changes the endpoint and auth shape so an old
- * config can never make OpenWordCode contact the removed service again.
- */
 function migratePersistedSettings(value: unknown): { value: unknown; changed: boolean } {
   if (!isRecord(value) || !isRecord(value.providers)) return { value, changed: false };
   const providers: Record<string, unknown> = { ...value.providers };
-  const legacy = providers.opencodex;
+  const legacy = providers["legacy-bridge"];
   const hasLegacy = legacy !== undefined;
   const hasBridge = providers["openwordcode-bridge"] !== undefined;
   let changed = false;
@@ -79,22 +74,41 @@ function migratePersistedSettings(value: unknown): { value: unknown; changed: bo
     changed = true;
   }
   if (hasLegacy) {
-    delete providers.opencodex;
+    delete providers["legacy-bridge"];
     changed = true;
   }
+  if (isRecord(providers.demo) && providers.demo.internal !== true) {
+    providers.demo = { ...providers.demo, internal: true };
+    changed = true;
+  }
+  // Ollama and LM Studio were removed from the product. Drop them from older
+  // persisted configs so they do not reappear in the account list.
+  for (const removed of ["ollama", "lm-studio"]) {
+    if (providers[removed] !== undefined) {
+      delete providers[removed];
+      changed = true;
+    }
+  }
   const rawSelectedProviderId = typeof value.selectedProviderId === "string" ? value.selectedProviderId : "";
-  let selectedProviderId = rawSelectedProviderId === "opencodex" ? "openwordcode-bridge" : rawSelectedProviderId;
+  let selectedProviderId = rawSelectedProviderId === "legacy-bridge" || rawSelectedProviderId === "ollama" || rawSelectedProviderId === "lm-studio" || rawSelectedProviderId === "demo"
+    ? "openwordcode-bridge"
+    : rawSelectedProviderId;
   let selectedModelId = typeof value.selectedModelId === "string" ? value.selectedModelId : undefined;
-  if (selectedProviderId !== rawSelectedProviderId) changed = true;
+  if (selectedProviderId !== rawSelectedProviderId) {
+    selectedModelId = "gpt-5.6-luna";
+    changed = true;
+  }
 
-  // The old default depended on an app-owned OAuth registration. Keep the
-  // bridge available as an advanced/local gateway, but move users who were
-  // blocked on that sign-in screen to the documented API-key provider.
+  // The public add-in is account-first. Move API-only selections to the local
+  // Bridge so a fresh install never lands on a provider with no public sign-in
+  // path. Existing OAuth-capable providers remain selectable.
   const selectedProviderValue: unknown = providers[selectedProviderId];
   const selectedAuth = isRecord(selectedProviderValue) && isRecord(selectedProviderValue.auth) ? selectedProviderValue.auth : undefined;
-  if (selectedProviderId === "openwordcode-bridge" && selectedAuth?.method === "oauth") {
-    selectedProviderId = "openai";
-    selectedModelId = "gpt-4.1-mini";
+  const selectedProviderIsPubliclyConnectable = selectedProviderId === "openwordcode-bridge"
+    || (isRecord(selectedProviderValue) && (selectedProviderValue.local === true || selectedAuth?.method === "none" || typeof selectedAuth?.oauthProvider === "string"));
+  if (!selectedProviderIsPubliclyConnectable) {
+    selectedProviderId = "openwordcode-bridge";
+    selectedModelId = "gpt-5.6-luna";
     changed = true;
   }
   return { value: { ...value, providers, selectedProviderId, selectedModelId }, changed };
@@ -117,8 +131,8 @@ export function defaultSettings(): Settings {
   const providers = Object.fromEntries(defaultProviderConfigs().map(provider => [provider.id, provider]));
   return {
     version: 1,
-    selectedProviderId: "openai",
-    selectedModelId: providers.openai?.defaultModel,
+    selectedProviderId: "openwordcode-bridge",
+    selectedModelId: providers["openwordcode-bridge"]?.defaultModel,
     mode: "manual",
     theme: "system",
     providers,

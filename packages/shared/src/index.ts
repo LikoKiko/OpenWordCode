@@ -24,8 +24,6 @@ export type ProviderKind =
   | "anthropic"
   | "gemini"
   | "google-antigravity"
-  | "ollama"
-  | "lm-studio"
   | "demo";
 
 export type ProviderId =
@@ -35,8 +33,6 @@ export type ProviderId =
   | "google"
   | "xai"
   | "kimi"
-  | "ollama"
-  | "lm-studio"
   | "openwordcode-bridge"
   | "demo"
   | (string & {});
@@ -72,6 +68,7 @@ export interface ProviderAuthInfo {
   availableMethods: AuthMethod[];
   credentialConfigured: boolean;
   environmentConfigured: boolean;
+  source?: "openwordcode-account" | "codex-cli" | "oauth" | "claude-cli" | "kimi-cli" | "antigravity-cli";
 }
 
 export interface ProviderSummary extends ProviderConfig {
@@ -108,6 +105,17 @@ export interface ChatAttachment {
   mimeType: "application/pdf" | "image/gif" | "image/jpeg" | "image/png" | "image/webp";
   size: number;
   dataUrl: string;
+}
+
+export interface SkillSummary {
+  id: string;
+  name: string;
+  description: string;
+  instructions: string;
+  isDefault?: boolean;
+  enabled?: boolean;
+  author?: string;
+  version?: string;
 }
 
 export interface ToolCall {
@@ -323,6 +331,7 @@ export interface AgentRequest {
   document: DocumentSnapshot;
   attachments?: ChatAttachment[];
   conversation?: ChatMessage[];
+  skills?: SkillSummary[];
   tools?: {
     webSearch?: boolean;
     console?: boolean;

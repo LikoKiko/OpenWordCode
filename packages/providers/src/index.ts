@@ -130,6 +130,15 @@ async function readCredential(config: ProviderConfig, store: CredentialStore, en
 function authHeaders(config: ProviderConfig, credential: ResolvedCredential | null, env: NodeJS.ProcessEnv = process.env): Record<string, string> {
   if (config.auth.method === "api-key" || config.auth.method === "environment" || config.auth.method === "oauth") {
     if (!credential) throw new ProviderError("auth_required", `${config.displayName} needs a configured credential or account sign-in`);
+    if (config.auth.oauthProvider === "kimi" && config.auth.method === "oauth") {
+      return {
+        Authorization: `Bearer ${credential.token}`,
+        "User-Agent": "KimiCLI/0.14.0",
+        "X-Msh-Platform": "kimi_cli",
+        "X-Msh-Version": "0.14.0",
+        "X-Msh-Device-Id": "openwordcode-local-cli",
+      };
+    }
     return { Authorization: `Bearer ${credential.token}` };
   }
   if (config.kind === "openwordcode-bridge") {
@@ -865,14 +874,6 @@ export function defaultProviderConfigs(): ProviderConfig[] {
       auth: { method: "oauth", credentialRef: "provider:openwordcode-account" }, defaultModel: "gpt-5.6-luna", privacyNote: "Internal account transport used by the OpenWordCode Bridge.",
     },
     {
-      id: "ollama", displayName: "Ollama", kind: "ollama", baseUrl: "http://127.0.0.1:11434/v1", enabled: true, local: true,
-      auth: { method: "none" }, defaultModel: "", privacyNote: "Local model; document content remains on this machine unless the Ollama endpoint is remote.",
-    },
-    {
-      id: "lm-studio", displayName: "LM Studio", kind: "lm-studio", baseUrl: "http://127.0.0.1:1234/v1", enabled: true, local: true,
-      auth: { method: "none" }, defaultModel: "", privacyNote: "Local model; document content remains on this machine unless the endpoint is remote.",
-    },
-    {
       id: "openai", displayName: "OpenAI", kind: "openai-compatible", baseUrl: "https://api.openai.com/v1", enabled: true, local: false,
       auth: { method: "api-key", credentialRef: "provider:openai" }, defaultModel: "gpt-4.1-mini", privacyNote: "Selected document context is sent to OpenAI's API for the chosen model.",
     },
@@ -909,7 +910,7 @@ export function defaultProviderConfigs(): ProviderConfig[] {
       auth: { method: "oauth", oauthProvider: "github-copilot", oauthCredentialRef: "oauth:github-copilot" }, defaultModel: "gpt-4o", privacyNote: "Selected document context is sent to GitHub Copilot using the signed-in GitHub account.",
     },
     {
-      id: "demo", displayName: "Demo (offline)", kind: "demo", baseUrl: "demo://offline", enabled: true, local: true,
+      id: "demo", displayName: "Demo (offline)", kind: "demo", baseUrl: "demo://offline", enabled: true, local: true, internal: true,
       auth: { method: "none" }, defaultModel: "demo-rewrite", privacyNote: "Offline deterministic demo; no document content leaves this process.",
     },
   ];

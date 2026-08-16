@@ -3,23 +3,20 @@ import {
   ArrowClockwise,
   ArrowLeft,
   ArrowUp,
-  Check,
+  CaretRight,
   ClockCounterClockwise,
-  FileText,
   GearSix,
   Globe,
-  Info,
-  Key,
   Paperclip,
   Plus,
   Sparkle,
   TerminalWindow,
   X,
 } from "@phosphor-icons/react";
-import type { AgentAction, AgentEvent, AgentMode, ChatAttachment, DocumentSnapshot, ModelInfo, ProposedChange, ProviderSummary } from "../../../packages/shared/src/index.js";
+import type { AgentAction, AgentEvent, AgentMode, ChatAttachment, DocumentSnapshot, ModelInfo, ProposedChange, ProviderSummary, SkillSummary } from "../../../packages/shared/src/index.js";
 import { comparableText, visualElementTargetText } from "../../../packages/shared/src/index.js";
 import { createWordAdapter, isOfficeHost, waitForOfficeReady, type WordApplicationAdapter } from "../../../packages/app-word/src/index.js";
-import { AppliedEditList, AttachmentList, ConsoleActionCard, ModePicker, ModelPicker, RecentTasksDrawer, SearchList, ThinkingTrace, type AppliedEdit, type AttachmentPreview, type ModelEffort, type RecentTask, type SearchItem } from "./components";
+import { AppliedEditList, AttachmentList, ConsoleActionCard, DEFAULT_SKILLS, ModePicker, ModelPicker, parseSkillFile, RecentTasksDrawer, SearchList, SkillsDrawer, ThinkingTrace, type AppliedEdit, type AttachmentPreview, type ModelEffort, type RecentTask, type SearchItem } from "./components";
 import {
   approveChange,
   approveConsoleAction,
@@ -34,15 +31,20 @@ import {
   getSettings,
   initializeCore,
   rejectConsoleAction,
-  saveApiKey,
   saveSettings,
   startOAuthLogin,
   startChatGPTLogin,
+  startCodexCliLogin,
+  startLocalCliLogin,
+  useLocalCliSession,
+  useCodexCliSession,
   streamAgent,
   cancelOAuthLogin,
+  completeOAuthLogin,
   disconnectOAuth,
 } from "./api";
 import type { OAuthLoginStart } from "./api";
+import { dismissNotifications, notifyError, notifySuccess } from "./notifications";
 
 type Tab = "chat" | "settings";
 type UiMessage = { id: string; role: "user" | "assistant"; content: string; toolActivity?: string; attachments?: AttachmentPreview[]; actions?: AgentAction[]; edits?: AppliedEdit[] };
@@ -52,8 +54,36 @@ const MAX_ATTACHMENTS = 4;
 const MAX_ATTACHMENT_BYTES = 6_000_000;
 const MAX_TOTAL_ATTACHMENT_BYTES = 12_000_000;
 const TASK_HISTORY_STORAGE_KEY = "openwordcode.task-history.v1";
+const SKILLS_STORAGE_KEY = "openwordcode.skills.v1";
 const MAX_TASK_HISTORY = 20;
 const SUPPORTED_IMAGE_TYPES = new Set(["image/gif", "image/jpeg", "image/png", "image/webp"]);
+function loadStoredSkills(): SkillSummary[] {
+  if (typeof window === "undefined") return DEFAULT_SKILLS;
+  try {
+    const raw = window.localStorage.getItem(SKILLS_STORAGE_KEY);
+    if (!raw) return DEFAULT_SKILLS;
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed) || !parsed.length) return DEFAULT_SKILLS;
+    const custom = parsed.filter(item => isRecord(item) && !item.isDefault) as SkillSummary[];
+    const defaults = DEFAULT_SKILLS.map(def => {
+      const saved = parsed.find(item => isRecord(item) && item.id === def.id) as SkillSummary | undefined;
+      return saved ? { ...def, enabled: saved.enabled !== false } : def;
+    });
+    return [...defaults, ...custom];
+  } catch {
+    return DEFAULT_SKILLS;
+  }
+}
+
+function saveStoredSkills(skills: SkillSummary[]): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(SKILLS_STORAGE_KEY, JSON.stringify(skills));
+  } catch {
+    // ignore
+  }
+}
+
 function fileMimeType(file: File): ChatAttachment["mimeType"] | null {
   if (file.type === "application/pdf" || SUPPORTED_IMAGE_TYPES.has(file.type)) return file.type as ChatAttachment["mimeType"];
   if (file.name.toLocaleLowerCase().endsWith(".pdf")) return "application/pdf";
@@ -169,64 +199,55 @@ function upsertTask(sessions: TaskSession[], id: string, messages: UiMessage[]):
   return [next, ...sessions.filter(session => session.id !== id)].slice(0, MAX_TASK_HISTORY);
 }
 
-function authLabel(provider: ProviderSummary): string {
-  if (provider.auth.status === "connected") return provider.auth.method === "environment" ? "Environment" : provider.auth.method === "api-key" ? "API key" : provider.auth.method === "oauth" ? provider.kind === "openwordcode-bridge" ? "OpenWordCode account" : "OAuth account" : "Connected";
-  if (provider.auth.status === "not-configured" && provider.local) return "Local";
-  if (provider.auth.status === "login-required" && provider.auth.method === "api-key") return "Add API key";
-  if (provider.auth.status === "login-required" && provider.auth.method === "oauth") return "Sign in";
-  if (provider.auth.status === "unsupported" && provider.auth.method === "oauth") return "Setup required";
-  return provider.auth.status.replace(/-/g, " ");
-}
-
-function ChatGPTAccountCard({ provider, busy, compact, onLogin, onDisconnect }: { provider: ProviderSummary; busy: boolean; compact?: boolean; onLogin: () => void; onDisconnect: () => void }): JSX.Element {
+function ChatGPTAccountCard({ provider, busy, codexLoginStarted, onLogin, onStartCodexCliLogin, onUseCodexCli, onDisconnect }: { provider: ProviderSummary; busy: boolean; codexLoginStarted?: boolean; onLogin: () => void; onStartCodexCliLogin: () => void; onUseCodexCli: () => void; onDisconnect: () => void }): JSX.Element {
   const connected = provider.auth.status === "connected";
-  const unsupported = provider.auth.status === "unsupported";
-  return <article className={`account-card${compact ? " compact" : ""}`}>
-    <div className="account-card-heading"><span className="account-card-icon"><Sparkle size={16} weight="fill" /></span><div><strong>OpenWordCode Bridge</strong><small>{connected ? "Account connected" : "Account sign-in"}</small></div><span className={`auth-badge ${provider.auth.status}`}>{authLabel(provider)}</span></div>
-    <h2>{connected ? "Your OpenWordCode account is ready" : "Connect your OpenWordCode account"}</h2>
-    <p>{connected ? provider.auth.detail : "Sign in in your browser. OpenWordCode never asks for your account password inside Word."}</p>
-    {unsupported ? <p className="account-card-warning">This build needs an OpenWordCode-owned OAuth client registration before account sign-in can be enabled.</p> : null}
-    <div className="account-card-actions">{connected ? <button className="text-button" type="button" onClick={onDisconnect}>Disconnect</button> : <button className="apply-button" type="button" onClick={onLogin} disabled={busy || unsupported}>{busy ? "Opening browser…" : "Sign in"}</button>}</div>
-  </article>;
+  const isCodexCli = provider.auth.source === "codex-cli";
+  return <div className="account-detail">
+    <p className="account-detail-text">{connected ? provider.auth.detail : isCodexCli ? "Connected via your local Codex CLI session." : "Sign in with your ChatGPT account in your browser or connect your local Codex CLI session."}</p>
+    <div className="account-actions">{connected ? <button className="text-button" type="button" onClick={onDisconnect}>Disconnect</button> : <><button className="apply-button" type="button" onClick={onLogin} disabled={busy}>{busy ? "Opening browser…" : "Sign in"}</button><button className="text-button" type="button" onClick={onUseCodexCli} disabled={busy}>{codexLoginStarted ? "Connect after login" : "Use Codex CLI"}</button>{onStartCodexCliLogin ? <button className="text-button" type="button" onClick={onStartCodexCliLogin} disabled={busy}>{codexLoginStarted ? "Waiting for login…" : "CLI login"}</button> : null}</>}</div>
+  </div>;
 }
 
-function OAuthAccountCard({ provider, flow, busy, compact, onLogin, onOpenBrowser, onCancel, onDisconnect }: { provider: ProviderSummary; flow: OAuthLoginStart | null; busy: boolean; compact?: boolean; onLogin: () => void; onOpenBrowser: () => void; onCancel: () => void; onDisconnect: () => void }): JSX.Element {
+function localCliForProvider(providerId: string): { source: "claude-cli" | "kimi-cli" | "antigravity-cli"; label: string } | null {
+  if (providerId === "anthropic") return { source: "claude-cli", label: "Claude Code" };
+  if (providerId === "kimi") return { source: "kimi-cli", label: "Kimi CLI" };
+  if (providerId === "google-antigravity") return { source: "antigravity-cli", label: "Antigravity CLI" };
+  return null;
+}
+
+function accountSubline(provider: ProviderSummary): string {
+  if (provider.auth.status === "connected") return "Connected";
+  if (provider.auth.status === "unsupported" && localCliForProvider(provider.id)) return "CLI connection available";
+  if (provider.auth.status === "expired") return "Session expired";
+  return provider.auth.status === "login-required" ? "Not connected" : provider.auth.status.replace(/-/g, " ");
+}
+
+function OAuthAccountCard({ provider, flow, busy, localCliLoginStarted, manualCode, onManualCodeChange, onCompleteManualCode, onLogin, onOpenBrowser, onCancel, onStartLocalCliLogin, onUseLocalCli, onDisconnect }: { provider: ProviderSummary; flow: OAuthLoginStart | null; busy: boolean; localCliLoginStarted?: boolean; manualCode?: string; onManualCodeChange?: (value: string) => void; onCompleteManualCode?: () => void; onLogin: () => void; onOpenBrowser: () => void; onCancel: () => void; onStartLocalCliLogin?: () => void; onUseLocalCli?: () => void; onDisconnect: () => void }): JSX.Element {
   const flowForProvider = flow?.providerId === provider.id ? flow : null;
-  const accountName = provider.id === "anthropic" ? "Claude" : provider.displayName;
+  const localCli = localCliForProvider(provider.id);
   const connected = provider.auth.method === "oauth" && provider.auth.status === "connected";
   const unsupported = provider.auth.status === "unsupported" && provider.auth.method === "oauth";
-  return <article className={`account-card oauth-card${compact ? " compact" : ""}`}>
-    <div className="account-card-heading"><span className="account-card-icon"><Globe size={16} /></span><div><strong>{accountName}</strong><small>{connected ? "Account connected" : "Account sign-in"}</small></div><span className={`auth-badge ${connected ? "connected" : unsupported ? "unsupported" : "login-required"}`}>{connected ? "Ready" : unsupported ? "Unavailable" : "Sign in"}</span></div>
-    <h2>{connected ? `${accountName} account is ready` : `Connect your ${accountName} account`}</h2>
-    <p>{connected ? provider.auth.detail : "Sign in in your browser. OpenWordCode never asks for your account password inside Word; the token stays in the local Core credential store."}</p>
-    {unsupported ? <p className="account-card-warning">This provider needs a provider-specific transport that is not enabled in this build.</p> : null}
-    {flowForProvider?.userCode ? <div className="oauth-code"><small>Verification code</small><code>{flowForProvider.userCode}</code></div> : null}
-    {flowForProvider?.detail ? <p className="oauth-flow-detail">{flowForProvider.detail}</p> : null}
-    <div className="account-card-actions">
-      {connected ? <button className="text-button" type="button" onClick={onDisconnect}>Disconnect</button> : flowForProvider ? <><button className="text-button" type="button" onClick={onCancel}>Cancel</button>{flowForProvider.authorizeUrl || flowForProvider.verificationUrl ? <button className="apply-button" type="button" onClick={onOpenBrowser}>Open sign-in</button> : null}</> : <button className="apply-button" type="button" onClick={onLogin} disabled={busy || unsupported}>{busy ? "Preparing sign-in…" : "Sign in"}</button>}
+  const usingLocalCli = localCli !== null && provider.auth.source === localCli.source;
+  return <div className="account-detail">
+    <p className="account-detail-text">{connected ? provider.auth.detail : usingLocalCli ? `Using ${localCli?.label} session` : "Sign in opens your browser. OpenWordCode stores credentials in your local encrypted store."}</p>
+    {flowForProvider?.userCode ? <div className="oauth-code"><span>Code</span><code>{flowForProvider.userCode}</code></div> : null}
+    {flowForProvider?.providerId === "xai" ? <div className="oauth-manual-code"><input value={manualCode ?? ""} onChange={event => onManualCodeChange?.(event.target.value)} placeholder="Paste the xAI code" autoComplete="off" spellCheck={false} /><button className="apply-button" type="button" onClick={onCompleteManualCode} disabled={!manualCode?.trim() || busy}>{busy ? "Checking…" : "Finish"}</button></div> : null}
+    {flowForProvider?.detail ? <p className="account-detail-note">{flowForProvider.detail}</p> : null}
+    <div className="account-actions">
+      {connected ? <button className="text-button" type="button" onClick={onDisconnect}>Disconnect</button> : flowForProvider ? <>{flowForProvider.authorizeUrl || flowForProvider.verificationUrl ? <button className="apply-button" type="button" onClick={onOpenBrowser}>Open sign-in</button> : null}<button className="text-button" type="button" onClick={onCancel}>Cancel</button></> : <><button className="apply-button" type="button" onClick={onLogin} disabled={busy || unsupported}>{busy ? "Opening browser…" : "Sign in"}</button>{localCli && onUseLocalCli ? <button className="text-button" type="button" onClick={onUseLocalCli} disabled={busy}>{localCliLoginStarted ? "Connect after login" : `Use ${localCli.label}`}</button> : null}{localCli && onStartLocalCliLogin ? <button className="text-button" type="button" onClick={onStartLocalCliLogin} disabled={busy}>{localCliLoginStarted ? `Waiting for ${localCli.label}…` : `Launch CLI`}</button> : null}</>}
     </div>
-  </article>;
-}
-
-function ApiKeyCard({ provider, value, busy, compact, onChange, onConnect }: { provider: ProviderSummary; value: string; busy: boolean; compact?: boolean; onChange: (value: string) => void; onConnect: () => void }): JSX.Element {
-  const connected = provider.auth.status === "connected";
-  return <article className={`account-card api-key-card${compact ? " compact" : ""}`}>
-    <div className="account-card-heading"><span className="account-card-icon"><Key size={16} /></span><div><strong>{provider.displayName}</strong><small>{connected ? "API key connected" : "API key setup"}</small></div><span className={`auth-badge ${provider.auth.status}`}>{connected ? "Ready" : "Required"}</span></div>
-    <h2>{connected ? "API access is ready" : `Connect ${provider.displayName}`}</h2>
-    <p>{connected ? "Replace the key below whenever you need to use a different account." : "Paste your API key to connect. It is sent only to OpenWordCode Core and stored in its local encrypted credential store."}</p>
-    <div className="key-form"><input type="password" value={value} onChange={event => onChange(event.target.value)} placeholder={connected ? "Paste a replacement API key" : "Paste API key"} autoComplete="off" /><button className="apply-button" type="button" onClick={onConnect} disabled={!value.trim() || busy}>{busy ? "Connecting…" : connected ? "Replace key" : "Connect"}</button></div>
-  </article>;
+  </div>;
 }
 
 export default function App(): JSX.Element {
   const [adapter, setAdapter] = useState<WordApplicationAdapter>(() => createWordAdapter());
   const [wordReady, setWordReady] = useState(() => !isOfficeHost());
-  const [snapshot, setSnapshot] = useState<DocumentSnapshot | null>(null);
+  const [, setSnapshot] = useState<DocumentSnapshot | null>(null);
   const [coreOnline, setCoreOnline] = useState(false);
   const [coreVersion, setCoreVersion] = useState("—");
   const [providers, setProviders] = useState<ProviderSummary[]>([]);
   const [models, setModels] = useState<ModelInfo[]>([]);
-  const [selectedProviderId, setSelectedProviderId] = useState("openai");
+  const [selectedProviderId, setSelectedProviderId] = useState("openwordcode-bridge");
   const [selectedModelId, setSelectedModelId] = useState("");
   const [modelEffort, setModelEffort] = useState<ModelEffort>("high");
   const [mode, setMode] = useState<AgentMode>("manual");
@@ -236,11 +257,15 @@ export default function App(): JSX.Element {
   const [taskSessions, setTaskSessions] = useState<TaskSession[]>(loadTaskSessions);
   const [activeTaskId, setActiveTaskId] = useState(() => taskSessions[0]?.id ?? uid());
   const [recentTasksOpen, setRecentTasksOpen] = useState(false);
+  const [skills, setSkills] = useState<SkillSummary[]>(loadStoredSkills);
+  const [skillsDrawerOpen, setSkillsDrawerOpen] = useState(false);
   const [messages, setMessages] = useState<UiMessage[]>(() => taskSessions[0]?.messages ?? []);
   const [busy, setBusy] = useState(false);
   const [loadingModels, setLoadingModels] = useState(false);
-  const [error, setError] = useState("");
-  const [keyInput, setKeyInput] = useState("");
+  const setError = useCallback((message: string): void => {
+    if (message) notifyError(message);
+    else dismissNotifications();
+  }, []);
   const [bridge, setBridge] = useState<{ available: boolean; endpoint: string; models: number; detail: string } | null>(null);
   const [actingAction, setActingAction] = useState<string | null>(null);
   const [abortController, setAbortController] = useState<AbortController | null>(null);
@@ -251,24 +276,23 @@ export default function App(): JSX.Element {
   const [uploadingFiles, setUploadingFiles] = useState(false);
   const [chatGptFlowId, setChatGptFlowId] = useState<string | null>(null);
   const [chatGptLoginBusy, setChatGptLoginBusy] = useState(false);
+  const [codexCliLoginStarted, setCodexCliLoginStarted] = useState(false);
   const [oauthFlowId, setOAuthFlowId] = useState<string | null>(null);
   const [oauthLoginInfo, setOAuthLoginInfo] = useState<OAuthLoginStart | null>(null);
+  const [oauthManualCode, setOAuthManualCode] = useState("");
   const [oauthLoginBusy, setOAuthLoginBusy] = useState(false);
+  const [localCliLoginProviderId, setLocalCliLoginProviderId] = useState<string | null>(null);
   const [approvalNoticeDismissed, setApprovalNoticeDismissed] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const autoAppliedChanges = useRef(new Set<string>());
   const applyQueue = useRef(Promise.resolve());
 
   const selectedProvider = useMemo(() => providers.find(provider => provider.id === selectedProviderId), [providers, selectedProviderId]);
-  const chatGptProvider = useMemo(() => providers.find(provider => provider.id === "openwordcode-bridge"), [providers]);
-  const genericOAuthVisible = Boolean(selectedProvider && selectedProvider.kind !== "openwordcode-bridge" && selectedProvider.auth.availableMethods.includes("oauth") && (selectedProvider.auth.method === "oauth" || selectedProvider.auth.method === "environment") && selectedProvider.auth.status !== "connected");
+  const visibleProviders = useMemo(() => providers.filter(provider => !provider.internal && provider.id !== "demo" && (provider.id === "openwordcode-bridge" || provider.auth.availableMethods.includes("oauth") || provider.auth.status === "connected")), [providers]);
+  const connectedProviderCount = useMemo(() => visibleProviders.filter(provider => provider.auth.status === "connected").length, [visibleProviders]);
+  const activeSkills = useMemo(() => skills.filter(skill => skill.enabled !== false), [skills]);
   const selectedModel = useMemo(() => models.find(model => model.id === selectedModelId), [models, selectedModelId]);
   const modelLabel = selectedModel?.name || selectedModelId || (loadingModels ? "Loading model…" : "Choose model");
-  const selectionLabel = snapshot?.selection.isTable
-    ? `Table selected${snapshot.selection.tableCount && snapshot.selection.tableCount > 1 ? ` · ${snapshot.selection.tableCount} tables` : ""}`
-    : snapshot?.selection.isEmpty
-    ? "No text selected"
-    : `${snapshot?.selection.text.length ?? 0} characters selected`;
 
   const refreshSnapshot = useCallback(async (): Promise<DocumentSnapshot> => {
     const next = await adapter.readSnapshot();
@@ -352,6 +376,54 @@ export default function App(): JSX.Element {
     return () => { disposed = true; if (timer !== undefined) window.clearTimeout(timer); };
   }, [chatGptFlowId, loadCore]);
   useEffect(() => {
+    if (!codexCliLoginStarted) return;
+    let disposed = false;
+    let timer: number | undefined;
+    const poll = async (): Promise<void> => {
+      try {
+        const nextProviders = await getProviders();
+        if (disposed) return;
+        const provider = nextProviders.find(item => item.kind === "openwordcode-bridge");
+        if (provider?.auth.source === "codex-cli" && provider.auth.status === "connected") {
+          setCodexCliLoginStarted(false);
+          setChatGptLoginBusy(false);
+          await saveSettings({ selectedProviderId: "openwordcode-bridge", selectedModelId: "gpt-5.6-luna" });
+          await loadCore();
+          return;
+        }
+        timer = window.setTimeout(() => { void poll(); }, 1_500);
+      } catch {
+        if (!disposed) timer = window.setTimeout(() => { void poll(); }, 2_000);
+      }
+    };
+    void poll();
+    return () => { disposed = true; if (timer !== undefined) window.clearTimeout(timer); };
+  }, [codexCliLoginStarted, loadCore]);
+  useEffect(() => {
+    if (!localCliLoginProviderId) return;
+    let disposed = false;
+    let timer: number | undefined;
+    const poll = async (): Promise<void> => {
+      try {
+        const nextProviders = await getProviders();
+        if (disposed) return;
+        const provider = nextProviders.find(item => item.id === localCliLoginProviderId);
+        const source = localCliForProvider(localCliLoginProviderId)?.source;
+        if (provider && source && provider.auth.source === source && provider.auth.status === "connected") {
+          setLocalCliLoginProviderId(null);
+          setOAuthLoginBusy(false);
+          await loadCore();
+          return;
+        }
+        timer = window.setTimeout(() => { void poll(); }, 1_500);
+      } catch {
+        if (!disposed) timer = window.setTimeout(() => { void poll(); }, 2_000);
+      }
+    };
+    void poll();
+    return () => { disposed = true; if (timer !== undefined) window.clearTimeout(timer); };
+  }, [localCliLoginProviderId, loadCore]);
+  useEffect(() => {
     if (!oauthFlowId) return;
     let disposed = false;
     let timer: number | undefined;
@@ -363,12 +435,14 @@ export default function App(): JSX.Element {
         if (result.status === "connected") {
           setOAuthFlowId(null);
           setOAuthLoginBusy(false);
+          setOAuthManualCode("");
           await loadCore();
           return;
         }
         if (result.status === "error" || result.status === "cancelled") {
           setOAuthFlowId(null);
           setOAuthLoginBusy(false);
+          setOAuthManualCode("");
           setError(result.detail);
           return;
         }
@@ -505,6 +579,7 @@ export default function App(): JSX.Element {
         document: current,
         ...(messages.length ? { conversation: messages.slice(-8).map(message => ({ role: message.role, content: message.content })) } : {}),
         ...(currentAttachments.length ? { attachments: currentAttachments } : {}),
+        skills: activeSkills,
         tools: { ...(webSearchEnabled ? { webSearch: true } : {}), ...(consoleEnabled ? { console: true } : {}) },
       }, (event: AgentEvent) => {
         if (event.type === "token") {
@@ -611,18 +686,6 @@ export default function App(): JSX.Element {
     await loadModels(id);
   };
 
-  const connectKey = async (): Promise<void> => {
-    if (!keyInput.trim() || !selectedProvider) return;
-    try {
-      await saveApiKey(selectedProvider.id, keyInput.trim());
-      setKeyInput("");
-      setProviders(await getProviders());
-      await loadModels(selectedProvider.id);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Could not save the API key");
-    }
-  };
-
   const loginChatGPT = async (): Promise<void> => {
     setChatGptLoginBusy(true);
     setError("");
@@ -637,8 +700,38 @@ export default function App(): JSX.Element {
     }
   };
 
+  const beginCodexCliLogin = async (): Promise<void> => {
+    setChatGptLoginBusy(true);
+    setError("");
+    try {
+      await startCodexCliLogin();
+      setCodexCliLoginStarted(true);
+      await loadCore();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not start Codex CLI sign-in");
+    } finally {
+      setChatGptLoginBusy(false);
+    }
+  };
+
+  const connectCodexCli = async (): Promise<void> => {
+    setChatGptLoginBusy(true);
+    setError("");
+    try {
+      await useCodexCliSession();
+      setCodexCliLoginStarted(false);
+      await saveSettings({ selectedProviderId: "openwordcode-bridge", selectedModelId: "gpt-5.6-luna" });
+      await loadCore();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not use the Codex CLI session");
+    } finally {
+      setChatGptLoginBusy(false);
+    }
+  };
+
   const logoutChatGPT = async (): Promise<void> => {
     try {
+      setCodexCliLoginStarted(false);
       await disconnectChatGPT();
       await loadCore();
     } catch (cause) {
@@ -661,6 +754,7 @@ export default function App(): JSX.Element {
       const flow = await startOAuthLogin(selectedProvider.id);
       setOAuthLoginInfo(flow);
       setOAuthFlowId(flow.flowId);
+      setOAuthManualCode("");
       const url = flow.authorizeUrl ?? flow.verificationUrl;
       if (url) {
         const browser = window.open(url, "_blank", "noopener,noreferrer");
@@ -669,7 +763,56 @@ export default function App(): JSX.Element {
     } catch (cause) {
       setOAuthLoginBusy(false);
       setOAuthLoginInfo(null);
+      setOAuthManualCode("");
       setError(cause instanceof Error ? cause.message : "Could not start OAuth sign-in");
+    }
+  };
+
+  const completeXaiCode = async (): Promise<void> => {
+    if (!oauthFlowId || !oauthManualCode.trim()) return;
+    setOAuthLoginBusy(true);
+    setError("");
+    try {
+      const result = await completeOAuthLogin(oauthFlowId, oauthManualCode.trim());
+      setOAuthLoginInfo(result);
+      if (result.status === "connected") {
+        setOAuthFlowId(null);
+        setOAuthLoginBusy(false);
+        setOAuthManualCode("");
+        await loadCore();
+      }
+    } catch (cause) {
+      setOAuthLoginBusy(false);
+      setError(cause instanceof Error ? cause.message : "Could not complete xAI sign-in");
+    }
+  };
+
+  const beginLocalCliLogin = async (): Promise<void> => {
+    if (!selectedProvider || !localCliForProvider(selectedProvider.id)) return;
+    setOAuthLoginBusy(true);
+    setError("");
+    try {
+      await startLocalCliLogin(selectedProvider.id);
+      setLocalCliLoginProviderId(selectedProvider.id);
+      await loadCore();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not start the local CLI sign-in");
+      setOAuthLoginBusy(false);
+    }
+  };
+
+  const connectLocalCli = async (): Promise<void> => {
+    if (!selectedProvider || !localCliForProvider(selectedProvider.id)) return;
+    setOAuthLoginBusy(true);
+    setError("");
+    try {
+      await useLocalCliSession(selectedProvider.id);
+      setLocalCliLoginProviderId(null);
+      await loadCore();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not use the local CLI session");
+    } finally {
+      setOAuthLoginBusy(false);
     }
   };
 
@@ -680,6 +823,7 @@ export default function App(): JSX.Element {
       setOAuthFlowId(null);
       setOAuthLoginInfo(null);
       setOAuthLoginBusy(false);
+      setOAuthManualCode("");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not cancel OAuth sign-in");
     }
@@ -688,8 +832,12 @@ export default function App(): JSX.Element {
   const logoutOAuth = async (): Promise<void> => {
     if (!selectedProvider || selectedProvider.kind === "openwordcode-bridge") return;
     try {
+      setLocalCliLoginProviderId(null);
+      setOAuthFlowId(null);
+      setOAuthLoginBusy(false);
       await disconnectOAuth(selectedProvider.id);
       setOAuthLoginInfo(null);
+      setOAuthManualCode("");
       await loadCore();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not disconnect OAuth account");
@@ -764,19 +912,63 @@ export default function App(): JSX.Element {
     void saveSettings({ mode: next });
   };
 
+  const toggleSkill = (id: string): void => {
+    setSkills(current => {
+      const next = current.map(skill => skill.id === id ? { ...skill, enabled: skill.enabled === false } : skill);
+      saveStoredSkills(next);
+      return next;
+    });
+  };
+
+  const uploadSkillFile = async (file: File): Promise<void> => {
+    try {
+      const text = await file.text();
+      const parsed = parseSkillFile(text, file.name);
+      const newSkill: SkillSummary = {
+        id: `skill_${uid()}`,
+        ...parsed,
+      };
+      setSkills(current => {
+        const next = [...current, newSkill];
+        saveStoredSkills(next);
+        return next;
+      });
+      notifySuccess(`Added skill: ${newSkill.name}`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not read skill file");
+    }
+  };
+
+  const createSkill = (draft: Omit<SkillSummary, "id">): void => {
+    const newSkill: SkillSummary = {
+      id: `skill_${uid()}`,
+      ...draft,
+    };
+    setSkills(current => {
+      const next = [...current, newSkill];
+      saveStoredSkills(next);
+      return next;
+    });
+    notifySuccess(`Saved skill: ${newSkill.name}`);
+  };
+
+  const deleteSkill = (id: string): void => {
+    setSkills(current => {
+      const next = current.filter(skill => skill.id !== id);
+      saveStoredSkills(next);
+      return next;
+    });
+  };
+
   const composerTools: SearchItem[] = [
     { label: "Add files or photos", shortcut: "Ctrl+U", icon: <Paperclip size={17} />, action: () => fileInputRef.current?.click() },
     { label: "Search the web", detail: webSearchEnabled ? "Enabled for this chat" : "Use live sources for current questions", icon: <Globe size={17} />, checked: webSearchEnabled, action: () => setWebSearchEnabled(current => !current) },
     { label: "Use Windows console", detail: consoleEnabled ? "Safe workspace commands enabled" : "Let the AI inspect the workspace with safe commands", icon: <TerminalWindow size={17} />, checked: consoleEnabled, action: () => setConsoleEnabled(current => !current) },
     {
-      label: "Skills",
+      label: "AI Skills",
+      detail: activeSkills.length ? `${activeSkills.length} active prompt ${activeSkills.length === 1 ? "recipe" : "recipes"}` : "Prompt recipes",
       icon: <Sparkle size={17} weight="fill" />,
-      children: [
-        { label: "Refresh document context", detail: selectionLabel, icon: <ArrowClockwise size={16} />, action: () => { void refreshSnapshot(); } },
-        { label: "Review selected text", detail: "Check clarity, grammar, and risks", icon: <Sparkle size={16} weight="fill" />, action: () => { void sendInstruction("Review the selected text for clarity, grammar, inconsistencies, and important issues."); } },
-        { label: "Rewrite selected text", detail: "Preserve meaning, improve the wording", icon: <FileText size={16} />, action: () => { void sendInstruction("Rewrite the selected text clearly while preserving its meaning."); } },
-        { label: "Insert a table", detail: "Add a 3 × 4 table at the cursor", icon: <Plus size={16} />, action: () => { void sendInstruction("Add a 3 by 4 table at the current cursor."); } },
-      ],
+      action: () => setSkillsDrawerOpen(true),
     },
   ];
 
@@ -792,26 +984,25 @@ export default function App(): JSX.Element {
             <span className="status-dot" />
           </span>
           <button className={`icon-button ${recentTasksOpen ? "active" : ""}`} onClick={() => setRecentTasksOpen(true)} aria-label="Chat history" title="Chat history">
-            <ClockCounterClockwise size={18} />
+            <ClockCounterClockwise size={16} />
             {recentTasks.length ? <span className="count-badge">{recentTasks.length}</span> : null}
           </button>
           <button className="new-task-button" onClick={newTask} aria-label="New task" title="New task">
-            <Plus size={15} weight="bold" /><span>New task</span>
+            <Plus size={13} weight="bold" /><span>New</span>
           </button>
           <button className={`icon-button ${tab === "settings" ? "active" : ""}`} onClick={() => setTab("settings")} aria-label="Settings" title="Settings">
-            <GearSix size={18} />
+            <GearSix size={16} />
           </button>
         </div>
       </header>
 
-      {error ? <div className="error-banner"><Info size={16} weight="fill" /><span>{error}</span><button onClick={() => setError("")} aria-label="Dismiss error"><X size={15} /></button></div> : null}
-
       {recentTasksOpen ? <RecentTasksDrawer tasks={recentTasks} activeTaskId={activeTaskId} onClose={() => setRecentTasksOpen(false)} onSelect={openTask} onNewTask={newTask} onDelete={deleteTask} onClearAll={clearTaskHistory} /> : null}
+      {skillsDrawerOpen ? <SkillsDrawer skills={skills} onToggleSkill={toggleSkill} onUploadSkill={uploadSkillFile} onCreateSkill={createSkill} onDeleteSkill={deleteSkill} onClose={() => setSkillsDrawerOpen(false)} /> : null}
 
       {tab === "chat" ? (
         <section className="chat-panel">
           <div className="chat-scroll">
-            {messages.length === 0 ? genericOAuthVisible ? <OAuthAccountCard provider={selectedProvider!} flow={oauthLoginInfo} busy={oauthLoginBusy} onLogin={() => void loginOAuth()} onOpenBrowser={openOAuthBrowser} onCancel={() => void cancelOAuth()} onDisconnect={() => void logoutOAuth()} /> : selectedProvider?.auth.status === "login-required" && selectedProvider.auth.availableMethods.includes("api-key") ? <ApiKeyCard provider={selectedProvider} value={keyInput} busy={loadingModels} onChange={setKeyInput} onConnect={() => void connectKey()} /> : chatGptProvider && selectedProvider?.kind === "openwordcode-bridge" ? <ChatGPTAccountCard provider={chatGptProvider} busy={chatGptLoginBusy} onLogin={() => void loginChatGPT()} onDisconnect={() => void logoutChatGPT()} /> : <div className="empty-chat" aria-hidden="true" /> : (
+            {messages.length === 0 ? <div className="empty-chat" aria-hidden="true" /> : (
               <div className="messages">
                 {messages.map(message => (
                   <article className={`message ${message.role}`} key={message.id}>
@@ -827,47 +1018,56 @@ export default function App(): JSX.Element {
 
           <div className="composer-wrap">
             {attachments.length ? <AttachmentList attachments={attachments} onRemove={removeAttachment} /> : null}
-            <textarea dir="auto" value={prompt} onChange={event => setPrompt(event.target.value)} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendInstruction(); } }} placeholder="Write a message…" disabled={!coreOnline || busy || !wordReady} rows={3} />
+            <textarea dir="auto" value={prompt} onChange={event => setPrompt(event.target.value)} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendInstruction(); } }} placeholder="Ask OpenWordCode…" disabled={!coreOnline || busy || !wordReady} rows={2} />
             <div className="composer-footer">
               <div className="composer-tools">
-                <button className={`composer-add ${composerToolsOpen ? "active" : ""}`} onClick={() => setComposerToolsOpen(current => !current)} aria-label="Open chat tools" aria-expanded={composerToolsOpen} title="Chat tools"><Plus size={19} /></button>
+                <button className={`composer-add ${composerToolsOpen ? "active" : ""}`} onClick={() => setComposerToolsOpen(current => !current)} aria-label="Open chat tools" aria-expanded={composerToolsOpen} title="Chat tools"><Plus size={15} weight="bold" /></button>
                 {composerToolsOpen ? <SearchList items={composerTools} onClose={() => setComposerToolsOpen(false)} /> : null}
               </div>
               <input ref={fileInputRef} className="file-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,.pdf" multiple onChange={event => void onFilesSelected(event)} />
               <ModePicker mode={mode} onChange={changeApprovalMode} disabled={!coreOnline || busy || !wordReady} />
               <ModelPicker models={models} selectedModelId={selectedModelId} label={modelLabel} loading={loadingModels} effort={modelEffort} onEffortChange={setModelEffort} onChange={modelId => { setSelectedModelId(modelId); void saveSettings({ selectedModelId: modelId }); }} disabled={!coreOnline || loadingModels || busy || !wordReady} />
-              {busy ? <button className="send-button stop" onClick={() => abortController?.abort()} aria-label="Stop response" title="Stop response"><X size={18} weight="bold" /></button> : <button className="send-button" onClick={() => void sendInstruction()} disabled={(!prompt.trim() && !attachments.length) || !selectedModelId || !coreOnline || uploadingFiles || !wordReady} aria-label="Send message" title="Send message"><ArrowUp size={18} weight="bold" /></button>}
+              {busy ? <button className="send-button stop" onClick={() => abortController?.abort()} aria-label="Stop response" title="Stop response"><X size={14} weight="bold" /></button> : <button className="send-button" onClick={() => void sendInstruction()} disabled={(!prompt.trim() && !attachments.length) || !selectedModelId || !coreOnline || uploadingFiles || !wordReady} aria-label="Send message" title="Send message"><ArrowUp size={14} weight="bold" /></button>}
             </div>
           </div>
-          <p className="composer-disclaimer">OpenWordCode can make mistakes. Please double-check responses.</p>
+          <p className="composer-disclaimer">OpenWordCode can make mistakes. Check important information.</p>
         </section>
       ) : null}
 
       {tab === "settings" ? (
         <section className="secondary-view settings-view">
-          <div className="view-heading"><button className="back-button" onClick={openChat}><ArrowLeft size={16} /> Chat</button><span className="settings-heading-label">Settings</span></div>
-          <div className="view-title"><div><h1>Settings</h1><p>Control providers, authentication, and appearance.</p></div><button className="text-button" onClick={() => void loadCore()}>Refresh</button></div>
-
-          <div className="settings-section">
-            <h2>Providers</h2>
-            <div className="provider-list">{providers.map(provider => <button className={`provider-row ${provider.id === selectedProviderId ? "selected" : ""}`} key={provider.id} onClick={() => void chooseProvider(provider.id)}><span className="provider-icon"><Sparkle size={15} weight="fill" /></span><span className="provider-copy"><strong>{provider.displayName}</strong><small>{provider.local ? "Local" : "Cloud"} · {authLabel(provider)}</small></span>{provider.id === selectedProviderId ? <Check size={16} weight="bold" /> : null}</button>)}</div>
+          <div className="settings-nav">
+            <button className="back-button" onClick={openChat}><ArrowLeft size={15} /> Chat</button>
+            <span className="settings-title">Settings</span>
+            <button className="settings-refresh" onClick={() => void loadCore()} aria-label="Refresh" title="Refresh"><ArrowClockwise size={15} /></button>
           </div>
 
-          <div className="settings-section settings-card">
-            <div className="setting-row heading-row"><div><h2>Authentication</h2><p>{selectedProvider?.displayName ?? "Choose a provider"}</p></div>{selectedProvider ? <span className={`auth-badge ${selectedProvider.auth.status}`}>{authLabel(selectedProvider)}</span> : null}</div>
-            {selectedProvider?.kind === "openwordcode-bridge" ? <ChatGPTAccountCard provider={selectedProvider} busy={chatGptLoginBusy} compact onLogin={() => void loginChatGPT()} onDisconnect={() => void logoutChatGPT()} /> : null}
-            {selectedProvider && selectedProvider.kind !== "openwordcode-bridge" && selectedProvider.auth.availableMethods.includes("oauth") ? <OAuthAccountCard provider={selectedProvider} flow={oauthLoginInfo} busy={oauthLoginBusy} compact onLogin={() => void loginOAuth()} onOpenBrowser={openOAuthBrowser} onCancel={() => void cancelOAuth()} onDisconnect={() => void logoutOAuth()} /> : null}
-            {selectedProvider?.auth.availableMethods.includes("api-key") ? <div className="key-form"><input type="password" value={keyInput} onChange={event => setKeyInput(event.target.value)} placeholder="Paste API key · stored only in Core" autoComplete="off" /><button className="apply-button" onClick={() => void connectKey()} disabled={!keyInput.trim() || loadingModels}>{loadingModels ? "Connecting…" : selectedProvider.auth.status === "connected" ? "Replace key" : "Connect"}</button></div> : null}
-            <p className="setting-detail">{selectedProvider?.auth.detail ?? "Authentication status will appear here."}</p>
-            {selectedProvider?.auth.availableMethods.includes("environment") ? <p className="setting-helper">Environment references are supported. Configure the provider variable in the Core process.</p> : null}
+          <div className="settings-group">
+            <div className="settings-label"><span>Accounts</span><small>{connectedProviderCount} connected</small></div>
+            <div className="settings-list">
+              {visibleProviders.map(provider => {
+                const active = provider.id === selectedProviderId;
+                return <div className={`settings-row-wrap ${active ? "expanded" : ""}`} key={provider.id}>
+                  <button className={`settings-row ${active ? "selected" : ""}`} onClick={() => void chooseProvider(provider.id)} aria-expanded={active}>
+                    <span className={`row-dot ${provider.auth.status}`} />
+                    <span className="row-name">{provider.displayName}</span>
+                    <span className="row-state">{accountSubline(provider)}</span>
+                    <CaretRight size={13} className={active ? "row-caret open" : "row-caret"} />
+                  </button>
+                  {active && selectedProvider ? <div className="settings-row-detail">
+                    {selectedProvider.kind === "openwordcode-bridge" ? <ChatGPTAccountCard provider={selectedProvider} busy={chatGptLoginBusy} codexLoginStarted={codexCliLoginStarted} onLogin={() => void loginChatGPT()} onStartCodexCliLogin={() => void beginCodexCliLogin()} onUseCodexCli={() => void connectCodexCli()} onDisconnect={() => void logoutChatGPT()} /> : selectedProvider.auth.availableMethods.includes("oauth") ? <OAuthAccountCard provider={selectedProvider} flow={oauthLoginInfo} busy={oauthLoginBusy} localCliLoginStarted={localCliLoginProviderId === selectedProvider.id} manualCode={oauthManualCode} onManualCodeChange={setOAuthManualCode} onCompleteManualCode={() => void completeXaiCode()} onLogin={() => void loginOAuth()} onOpenBrowser={openOAuthBrowser} onCancel={() => void cancelOAuth()} onStartLocalCliLogin={() => void beginLocalCliLogin()} onUseLocalCli={() => void connectLocalCli()} onDisconnect={() => void logoutOAuth()} /> : <div className="account-detail"><p className="account-detail-text">{selectedProvider.auth.detail}</p></div>}
+                    {selectedProviderId === "openwordcode-bridge" ? <div className="bridge-meta"><span>{bridge?.available ? `${bridge.models} models · ${bridge.endpoint}` : bridge?.detail ?? "Detecting…"}</span><button className="text-button" onClick={() => void getBridgeStatus().then(setBridge)}>Refresh</button></div> : null}
+                  </div> : null}
+                </div>;
+              })}
+            </div>
           </div>
 
-          <div className="settings-section">
-            <h2>Appearance</h2>
+          <div className="settings-group">
+            <div className="settings-label"><span>Appearance</span></div>
             <div className="segmented">{(["system", "light", "dark"] as const).map(value => <button className={theme === value ? "active" : ""} key={value} onClick={() => { setTheme(value); void saveSettings({ theme: value }); }}>{value[0]!.toUpperCase() + value.slice(1)}</button>)}</div>
           </div>
 
-          {selectedProviderId === "openwordcode-bridge" ? <div className="bridge-card"><div><strong>OpenWordCode Bridge</strong><small>{bridge?.available ? `${bridge.models} models · ${bridge.endpoint}` : bridge?.detail ?? "Detecting local bridge…"}</small></div><button className="text-button" onClick={() => void getBridgeStatus().then(setBridge)}>Refresh</button></div> : null}
           <div className="about-row"><span>OpenWordCode</span><span>Core {coreVersion}</span></div>
         </section>
       ) : null}

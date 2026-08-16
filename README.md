@@ -15,8 +15,7 @@ for a request, and turns document changes into reviewable, tracked edits.
 **Status:** early public development (`0.1.x`)
 
 OpenWordCode is an independent project. It does not require the sibling
-OpenCodex project, another application's proxy, browser cookies, or credential
-files.
+project, another application's proxy, browser cookies, or credential files.
 
 ## What it can do
 
@@ -27,8 +26,8 @@ files.
 - Apply approved edits through the Office adapter with stale-target checks and
   tracked-change-friendly behavior.
 - Attach images and PDFs for providers that support multimodal input.
-- Use provider API keys, local models, the OpenWordCode Bridge, or supported
-  provider-specific OAuth flows.
+- Use the OpenWordCode Bridge, supported provider OAuth/CLI sessions, or local
+  models. The Word task pane does not expose API-key entry.
 - Search the web when enabled and inspect a bounded local workspace through the
   read-only console tool.
 - Keep provider credentials in the local Core credential store instead of the
@@ -45,8 +44,8 @@ For the real add-in workflow:
 - Windows 10 or Windows 11.
 - Microsoft Word Desktop with Office Add-ins enabled.
 - Node.js 20 or newer and npm.
-- An API key, local model, or supported account connection for the provider you
-  choose.
+- A supported account connection or a local model. Cloud sign-in is handled by
+  the OpenWordCode Bridge, OAuth, or an official provider CLI session.
 
 The browser preview and automated tests can run without Microsoft Word, but
 they use the in-memory Word adapter and cannot validate a live document.
@@ -73,10 +72,11 @@ The development processes listen on:
 Open `https://localhost:3000` once in a browser and trust the local development
 certificate if your browser asks. Leave `npm run dev` running while testing.
 
-The default provider is OpenAI and expects the user's own API key. You can
-connect it in the task pane or set `OPENAI_API_KEY` in your local `.env`. The
-Core stores an in-app key in its local encrypted credential store; it is not
-returned to the browser UI.
+The public task pane is account-first: choose the OpenWordCode Bridge, a
+provider with OAuth/CLI support, or a local model. It intentionally does not
+show an API-key field. Existing Core configurations may continue to resolve
+legacy credentials for backward compatibility, but new users connect through
+an account or local runtime.
 
 ## Sideload into Word Desktop
 
@@ -105,12 +105,12 @@ Copy `.env.example` to `.env` only for local development. The file is ignored
 by Git. Never place real credentials in source, screenshots, issues, tests, or
 pull requests.
 
-### API keys and local models
+### Local models and account connections
 
-The built-in providers include OpenAI, Anthropic, OpenRouter, Google Gemini,
-xAI, Kimi Code, Nous, Ollama, LM Studio, and the offline demo provider. API
-keys can be entered in the task pane or supplied through the matching
-environment variable. Ollama, LM Studio, and Demo do not require credentials.
+The built-in providers include the OpenWordCode Bridge, Anthropic, Google
+Antigravity, xAI, Kimi Code, Nous, and GitHub Copilot. The public Word UI
+exposes account/CLI sign-in for these providers. API-key entry is intentionally
+not part of the public add-in flow.
 
 ### OAuth
 
@@ -125,6 +125,27 @@ owned by the OpenWordCode deployment. Set
 adding the localhost callback. Google Antigravity sign-in also requires a
 provider-approved `GOOGLE_ANTIGRAVITY_CLIENT_SECRET` in the Core environment.
 Neither value belongs in GitHub.
+
+If a user already has ChatGPT access through Codex CLI, select the OpenWordCode
+Bridge in Word and choose **Sign in with Codex CLI**. OpenWordCode starts the
+official local Codex browser login and detects completion automatically. Users
+can also run `codex login` themselves and choose **Connect existing session**.
+On Windows, the add-in searches the per-user OpenAI Codex installation instead
+of trusting a broken Microsoft Store command alias. Set `CODEX_CLI_PATH` if the
+CLI is installed somewhere else. This opt-in path reads the local Codex CLI
+session on demand; OpenWordCode does not copy the token into the repository or
+its own credential store.
+
+The same opt-in local-session connector is available for Claude Code, Kimi Code,
+and Google Antigravity. Use **Sign in with Claude Code**, **Sign in with Kimi
+CLI**, or **Sign in with Antigravity CLI**, or run the official CLI login first
+and choose **Connect existing … session**. Claude and Kimi use their documented
+local credential files; Antigravity uses the operating-system keyring entry
+owned by `agy`, not browser cookies or guessed plaintext files. Refreshed local
+CLI tokens stay in Core memory and are not copied into OpenWordCode storage.
+Set `CLAUDE_CLI_PATH`, `KIMI_CLI_PATH`, or `ANTIGRAVITY_CLI_PATH` when a CLI is
+installed outside PATH. These are provider-owned sessions, so connecting one
+does not sign in to another.
 
 Cursor, Kiro, and Command Code are intentionally not enabled as generic bearer
 token providers. Their account sessions require provider-specific transports;

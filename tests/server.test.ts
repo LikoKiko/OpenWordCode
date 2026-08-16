@@ -32,10 +32,10 @@ describe("Core API", () => {
     ]));
     const chatgpt = (providers.json() as { providers: Array<{ id: string; auth: { status: string; method: string } }> }).providers.find(provider => provider.id === "openwordcode-bridge");
     expect(chatgpt?.auth.method).toBe("oauth");
-    expect(chatgpt?.auth.status).toBe("unsupported");
+    expect(chatgpt?.auth.status).toBe("login-required");
     const login = await app.inject({ method: "POST", url: "/api/auth/chatgpt/start", headers: { ...headers, "content-type": "application/json" }, payload: {} });
-    expect(login.statusCode).toBe(409);
-    expect(login.json()).toMatchObject({ error: "oauth_not_configured" });
+    expect(login.statusCode).toBe(200);
+    expect((login.json() as { authorizeUrl: string }).authorizeUrl).toContain("https://auth.openai.com/oauth/authorize");
     const text = "The customers needs to submit the form.";
     const agent = await app.inject({ method: "POST", url: "/api/agent", headers: { ...headers, "content-type": "application/json" }, payload: { providerId: "demo", modelId: "demo-rewrite", instruction: "Fix grammar", mode: "manual", document: { documentId: "test", selection: { text, isEmpty: false, rangeStart: -1, rangeEnd: -1, target: { kind: "selection", id: "selection", beforeText: text, beforeFingerprint: "ignored" } }, documentText: text, paragraphs: [{ id: "p0", index: 0, text }], outline: [], capabilities: { canRead: true, canWrite: true, canComment: false, canFormat: false } } } });
     expect(agent.statusCode).toBe(200);
