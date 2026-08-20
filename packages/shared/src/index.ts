@@ -122,6 +122,8 @@ export interface ToolCall {
   id: string;
   name: string;
   arguments: string;
+  /** Opaque Google reasoning handle that must be replayed with its function call. */
+  thoughtSignature?: string;
 }
 
 export interface ChatToolDefinition {
@@ -332,6 +334,7 @@ export interface AgentRequest {
   attachments?: ChatAttachment[];
   conversation?: ChatMessage[];
   skills?: SkillSummary[];
+  effort?: string;
   tools?: {
     webSearch?: boolean;
     console?: boolean;

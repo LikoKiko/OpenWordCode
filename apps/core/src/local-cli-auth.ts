@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { access, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, isAbsolute, join, resolve } from "node:path";
+import { ANTIGRAVITY_IDE_VERSION, antigravityUserAgent } from "../../../packages/providers/src/index.js";
 
 /**
  * Local CLI sessions are deliberately separate from OpenWordCode OAuth.
@@ -404,7 +405,7 @@ async function postToken(fetchImpl: typeof fetch, url: string, values: Record<st
 }
 
 async function discoverAntigravityProject(accessToken: string, fetchImpl: typeof fetch): Promise<string | undefined> {
-  const headers = { Authorization: `Bearer ${accessToken}`, Accept: "*/*", "Content-Type": "application/json", "User-Agent": "antigravity/ide/2.5.5 (aidev_client; os_type=windows; arch=amd64)" };
+  const headers = { Authorization: `Bearer ${accessToken}`, Accept: "*/*", "Content-Type": "application/json", "User-Agent": antigravityUserAgent() };
   const extract = (value: unknown): string | undefined => {
     const root = recordValue(value);
     if (!root) return undefined;
@@ -424,8 +425,8 @@ async function discoverAntigravityProject(accessToken: string, fetchImpl: typeof
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const response = await fetchImpl(`${GOOGLE_CLOUD_CODE_DAILY_API}/${GOOGLE_API_VERSION}:onboardUser`, {
       method: "POST",
-      headers: { ...headers, "x-goog-api-client": "google-api-nodejs-client/10.3.0" },
-      body: JSON.stringify({ tier_id: "free-tier", metadata: { ide_type: "ANTIGRAVITY", ide_name: "antigravity", ide_version: "2.5.5" } }),
+      headers,
+      body: JSON.stringify({ tier_id: "free-tier", metadata: { ide_type: "ANTIGRAVITY", ide_name: "antigravity", ide_version: ANTIGRAVITY_IDE_VERSION } }),
       signal: AbortSignal.timeout(LOCAL_CLI_TIMEOUT_MS),
     });
     const payload = await response.json().catch(() => ({}));

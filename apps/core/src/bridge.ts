@@ -21,6 +21,7 @@ const bridgeBodySchema = z.object({
   messages: z.array(z.unknown()).min(1).max(40),
   stream: z.boolean().optional(),
   tools: z.array(z.unknown()).max(64).optional(),
+  reasoning_effort: z.enum(["low", "medium", "high"]).optional(),
 }).passthrough();
 
 type RecordValue = Record<string, unknown>;
@@ -207,7 +208,13 @@ function toolCallsFromMessage(value: unknown): ToolCall[] | undefined {
     const fn = isRecord(raw.function) ? raw.function : raw;
     const name = stringValue(fn.name);
     if (!name) return [];
-    return [{ id: stringValue(raw.id) ?? `bridge-call-${index}`, name, arguments: stringValue(fn.arguments) ?? "{}" }];
+    const thoughtSignature = stringValue(raw.thought_signature) ?? stringValue(raw.thoughtSignature);
+    return [{
+      id: stringValue(raw.id) ?? `bridge-call-${index}`,
+      name,
+      arguments: stringValue(fn.arguments) ?? "{}",
+      ...(thoughtSignature ? { thoughtSignature } : {}),
+    }];
   });
   return calls.length ? calls : undefined;
 }
@@ -272,7 +279,7 @@ interface CollectedCompletion {
   toolCalls: ToolCall[];
 }
 
-async function collectCompletion(runtime: ProviderRuntime, request: { model: string; messages: ChatMessage[]; attachments: ChatAttachment[]; tools?: ChatToolDefinition[]; signal: AbortSignal }): Promise<CollectedCompletion> {
+async function collectCompletion(runtime: ProviderRuntime, request: { model: string; messages: ChatMessage[]; attachments: ChatAttachment[]; tools?: ChatToolDefinition[]; effort?: string; signal: AbortSignal }): Promise<CollectedCompletion> {
   const text: string[] = [];
   const toolCalls: ToolCall[] = [];
   for await (const event of runtime.streamChat(request)) {
@@ -300,7 +307,12 @@ function modelRow(model: ModelInfo): RecordValue {
 function messageResponse(model: string, result: CollectedCompletion): RecordValue {
   const message: RecordValue = { role: "assistant", content: result.text || null };
   if (result.toolCalls.length) {
-    message.tool_calls = result.toolCalls.map(call => ({ id: call.id, type: "function", function: { name: call.name, arguments: call.arguments || "{}" } }));
+    message.tool_calls = result.toolCalls.map(call => ({
+      id: call.id,
+      type: "function",
+      function: { name: call.name, arguments: call.arguments || "{}" },
+      ...(call.thoughtSignature ? { thought_signature: call.thoughtSignature } : {}),
+    }));
   }
   return {
     id: completionId(),
@@ -311,7 +323,7 @@ function messageResponse(model: string, result: CollectedCompletion): RecordValu
   };
 }
 
-async function streamCompletion(reply: FastifyReply, request: FastifyRequest, runtime: ProviderRuntime, body: { model: string; messages: ChatMessage[]; attachments: ChatAttachment[]; tools?: ChatToolDefinition[] }): Promise<void> {
+async function streamCompletion(reply: FastifyReply, request: FastifyRequest, runtime: ProviderRuntime, body: { model: string; messages: ChatMessage[]; attachments: ChatAttachment[]; tools?: ChatToolDefinition[]; effort?: string }): Promise<void> {
   const id = completionId();
   const created = Math.floor(Date.now() / 1_000);
   const controller = new AbortController();
@@ -328,7 +340,25 @@ async function streamCompletion(reply: FastifyReply, request: FastifyRequest, ru
       if (event.type === "tool_call") {
         const index = toolIndex;
         toolIndex += 1;
-        reply.raw.write(sseFrame({ id, object: "chat.completion.chunk", created, model: body.model, choices: [{ index: 0, delta: { tool_calls: [{ index, id: event.call.id, type: "function", function: { name: event.call.name, arguments: event.call.arguments || "{}" } }] }, finish_reason: null }] }));
+        reply.raw.write(sseFrame({
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model: body.model,
+          choices: [{
+            index: 0,
+            delta: {
+              tool_calls: [{
+                index,
+                id: event.call.id,
+                type: "function",
+                function: { name: event.call.name, arguments: event.call.arguments || "{}" },
+                ...(event.call.thoughtSignature ? { thought_signature: event.call.thoughtSignature } : {}),
+              }],
+            },
+            finish_reason: null,
+          }],
+        }));
       }
     }
     reply.raw.write(sseFrame({ id, object: "chat.completion.chunk", created, model: body.model, choices: [{ index: 0, delta: {}, finish_reason: toolIndex ? "tool_calls" : "stop" }] }));
@@ -415,7 +445,13 @@ export async function buildBridgeServer(state: CoreState): Promise<FastifyInstan
     const { messages, attachments } = sharedMessages(parsed.data.messages);
     const tools = sharedTools(parsed.data.tools);
     const route = await routeForModel(state, parsed.data.model);
-    const body = { model: route.model.id || parsed.data.model, messages, attachments, ...(tools ? { tools } : {}) };
+    const body = {
+      model: route.model.id || parsed.data.model,
+      messages,
+      attachments,
+      ...(tools ? { tools } : {}),
+      ...(parsed.data.reasoning_effort ? { effort: parsed.data.reasoning_effort } : {}),
+    };
     if (parsed.data.stream !== false) {
       await streamCompletion(reply, request, runtimeForBridge(state, route.provider), body);
       return reply;

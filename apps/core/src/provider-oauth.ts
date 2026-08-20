@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { CredentialStore } from "../../../packages/auth/src/index.js";
 import type { ProviderConfig } from "../../../packages/shared/src/index.js";
-import type { ProviderOAuthCredential } from "../../../packages/providers/src/index.js";
+import { ANTIGRAVITY_IDE_VERSION, antigravityUserAgent, type ProviderOAuthCredential } from "../../../packages/providers/src/index.js";
 import {
   ensureAntigravityProject,
   isLocalCliCredentialLive,
@@ -104,6 +104,8 @@ const GITHUB_COPILOT_BASE_URL = "https://api.githubcopilot.com";
 const NOUS_BASE_URL = "https://portal.nousresearch.com";
 const NOUS_CLIENT_ID = "hermes-cli";
 const NOUS_INFERENCE_BASE_URL = "https://inference-api.nousresearch.com/v1";
+const OAUTH_REQUEST_TIMEOUT_MS = 30_000;
+const MAX_DEVICE_POLL_INTERVAL_MS = 30_000;
 
 const LOOPBACK: Record<"anthropic" | "xai" | "google-antigravity", { port: number; authorizePath: string }> = {
   anthropic: { port: 54545, authorizePath: "/callback" },
@@ -141,6 +143,12 @@ interface DeviceFlowData {
   deadline: number;
   verificationUrl: string;
   userCode: string;
+}
+
+interface DevicePollResult {
+  credential: StoredOAuthCredential | null;
+  slowDown: boolean;
+  retryAfterMs?: number;
 }
 
 interface OAuthFlow {
@@ -211,6 +219,28 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+function requestSignal(signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(OAUTH_REQUEST_TIMEOUT_MS);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+export function validateXaiOAuthEndpoint(rawUrl: string): string {
+  const parsed = new URL(rawUrl);
+  const host = parsed.hostname.toLowerCase();
+  if (parsed.protocol !== "https:"
+    || parsed.username
+    || parsed.password
+    || (parsed.port && parsed.port !== "443")
+    || (host !== "x.ai" && !host.endsWith(".x.ai"))) {
+    throw new Error(`xAI OAuth discovery returned an unexpected endpoint: ${rawUrl}`);
+  }
+  return parsed.toString();
+}
+
+export function nextDevicePollInterval(currentMs: number, retryAfterMs?: number): number {
+  return Math.min(MAX_DEVICE_POLL_INTERVAL_MS, Math.max(currentMs + 5_000, retryAfterMs ?? 0));
+}
+
 function expiresAt(payload: TokenPayload, fallbackMs = 60 * 60 * 1000): number {
   if (typeof payload.expires_at === "number" && Number.isFinite(payload.expires_at)) {
     return payload.expires_at > 10_000_000_000 ? payload.expires_at - 120_000 : payload.expires_at * 1000 - 120_000;
@@ -263,7 +293,8 @@ async function postForm(fetchImpl: typeof fetch, url: string, values: Record<str
     method: "POST",
     headers: { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded", ...headers },
     body: new URLSearchParams(values).toString(),
-    signal,
+    redirect: "error",
+    signal: requestSignal(signal),
   });
   const payload = await readJson(response);
   if (!response.ok) {
@@ -278,7 +309,8 @@ async function postJson(fetchImpl: typeof fetch, url: string, values: Record<str
     method: "POST",
     headers: { Accept: "application/json", "Content-Type": "application/json" },
     body: JSON.stringify(values),
-    signal,
+    redirect: "error",
+    signal: requestSignal(signal),
   });
   const payload = await readJson(response);
   if (!response.ok) {
@@ -311,6 +343,14 @@ function asStored(providerId: SupportedOAuthProviderId, payload: TokenPayload & 
   };
 }
 
+function asNousStored(payload: TokenPayload & Record<string, unknown>, submittedRefreshToken?: string): StoredOAuthCredential {
+  const rotatedRefreshToken = stringValue(payload.refresh_token);
+  if (submittedRefreshToken && (!rotatedRefreshToken || rotatedRefreshToken === submittedRefreshToken)) {
+    throw new Error("Nous Portal did not rotate its single-use refresh token. Sign in again rather than replaying the consumed token.");
+  }
+  return asStored("nous", payload, undefined, { apiBaseUrl: NOUS_INFERENCE_BASE_URL });
+}
+
 function toProviderCredential(value: { accessToken: string; accountId?: string; projectId?: string; apiBaseUrl?: string }): ProviderOAuthCredential {
   return {
     accessToken: value.accessToken,
@@ -336,6 +376,7 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 
 export class ProviderOAuthManager {
   private readonly flows = new Map<string, OAuthFlow>();
+  private readonly activeFlowByProvider = new Map<SupportedOAuthProviderId, string>();
   private readonly refreshes = new Map<string, Promise<StoredOAuthCredential>>();
   private readonly localCliRefreshes = new Map<LocalCliProviderId, Promise<LocalCliCredential>>();
   private readonly localCliCache = new Map<LocalCliProviderId, LocalCliCredential>();
@@ -365,13 +406,19 @@ export class ProviderOAuthManager {
       const cached = this.localCliCache.get(providerId);
       const credential = persisted && isLocalCliCredentialLive(persisted) ? persisted : cached && isLocalCliCredentialLive(cached) ? cached : persisted ?? cached;
       if (!credential) return { status: "login-required", detail: `Sign in with ${localCliDisplayName(providerId)}, then connect the session here.`, credentialConfigured: false, ...(source ? { source } : {}) };
-      if (!isLocalCliCredentialLive(credential)) return { status: "expired", detail: `${localCliDisplayName(providerId)} session expired. Sign in again with the CLI, then reconnect it here.`, credentialConfigured: true, ...(source ? { source } : {}) };
+      if (!isLocalCliCredentialLive(credential)) {
+        if (credential.refreshToken) return { status: "connected", detail: `${localCliDisplayName(providerId)} session will renew automatically when used.`, credentialConfigured: true, ...(source ? { source } : {}) };
+        return { status: "expired", detail: `${localCliDisplayName(providerId)} session expired. Sign in again with the CLI, then reconnect it here.`, credentialConfigured: true, ...(source ? { source } : {}) };
+      }
       const detail = credential.email ? `Using your ${localCliDisplayName(providerId)} session (${credential.email})` : `Using your ${localCliDisplayName(providerId)} session`;
       return { status: "connected", detail, credentialConfigured: true, ...(source ? { source } : {}) };
     }
     const stored = await this.read(provider.auth.oauthCredentialRef ?? `oauth:${providerId}`);
     if (!stored) return { status: "login-required", detail: `Sign in with your ${provider.displayName} account.`, credentialConfigured: false };
-    if (stored.expiresAt <= Date.now()) return { status: "expired", detail: stored.email ? `${stored.email} needs to sign in again.` : "The saved OAuth session has expired.", credentialConfigured: true };
+    if (stored.expiresAt <= Date.now()) {
+      if (stored.refreshToken) return { status: "connected", detail: stored.email ? `Connected as ${stored.email}; the session will renew automatically.` : "OAuth session will renew automatically when used.", credentialConfigured: true };
+      return { status: "expired", detail: stored.email ? `${stored.email} needs to sign in again.` : "The saved OAuth session has expired.", credentialConfigured: true };
+    }
     return { status: "connected", detail: stored.email ? `Connected as ${stored.email}` : "OAuth account connected", credentialConfigured: true };
   }
 
@@ -432,6 +479,10 @@ export class ProviderOAuthManager {
 
   async start(providerId: string): Promise<OAuthFlowSnapshot> {
     if (!oauthProviderIsSupported(providerId)) throw new Error(`OAuth for ${providerId} requires a provider-specific transport and is not enabled in this build`);
+    const activeFlowId = this.activeFlowByProvider.get(providerId);
+    const activeFlow = activeFlowId ? this.flows.get(activeFlowId) : undefined;
+    if (activeFlow?.status === "pending" && Date.parse(activeFlow.expiresAt) > Date.now()) return this.snapshot(activeFlow);
+    if (activeFlow?.status === "pending") this.fail(activeFlow, "OAuth flow timed out");
     if (localCliProviderIsSupported(providerId)) await this.store.remove(this.localCliSourceRef(providerId));
     const flow: OAuthFlow = {
       id: `oauth_${randomUUID()}`,
@@ -443,6 +494,7 @@ export class ProviderOAuthManager {
       controller: new AbortController(),
     };
     this.flows.set(flow.id, flow);
+    this.activeFlowByProvider.set(providerId, flow.id);
     try {
       if (providerId === "kimi" || providerId === "github-copilot" || providerId === "nous") return await this.startDevice(flow);
       return await this.startBrowser(flow);
@@ -468,7 +520,7 @@ export class ProviderOAuthManager {
     if (!value) throw new Error("Paste the authorization code from the xAI sign-in page");
     try {
       const credential = await this.exchangeBrowser(flow, value);
-      await this.save(`oauth:${flow.providerId}`, credential);
+      await this.saveFlowCredential(flow, credential);
       flow.status = "connected";
       flow.detail = credential.email ? `Connected as ${credential.email}` : `${this.displayName(flow.providerId)} account connected`;
       this.closeServer(flow);
@@ -513,6 +565,20 @@ export class ProviderOAuthManager {
 
   private async save(ref: string, credential: StoredOAuthCredential): Promise<void> {
     await this.store.set(ref, JSON.stringify(credential));
+  }
+
+  private assertCurrentFlow(flow: OAuthFlow): void {
+    if (flow.status !== "pending"
+      || flow.controller.signal.aborted
+      || this.activeFlowByProvider.get(flow.providerId) !== flow.id) {
+      throw new Error("OAuth sign-in was superseded by a newer attempt");
+    }
+  }
+
+  private async saveFlowCredential(flow: OAuthFlow, credential: StoredOAuthCredential): Promise<void> {
+    await this.store.set(`oauth:${flow.providerId}`, JSON.stringify(credential), {
+      assertBeforePersist: () => this.assertCurrentFlow(flow),
+    });
   }
 
   private localCliSourceRef(providerId: LocalCliProviderId): string {
@@ -607,7 +673,7 @@ export class ProviderOAuthManager {
     }
     try {
       const credential = await this.exchangeBrowser(flow, code);
-      await this.save(`oauth:${flow.providerId}`, credential);
+      await this.saveFlowCredential(flow, credential);
       flow.status = "connected";
       flow.detail = credential.email ? `Connected as ${credential.email}` : `${this.displayName(flow.providerId)} account connected`;
       sendHtml(response, true, flow.detail);
@@ -698,59 +764,64 @@ export class ProviderOAuthManager {
     while (Date.now() < device.deadline && flow.status === "pending") {
       await sleep(intervalMs, flow.controller.signal);
       if (Date.now() >= device.deadline || flow.status !== "pending") break;
-      const credential = device.kind === "github-copilot"
+      const result = device.kind === "github-copilot"
         ? await this.pollGithub(flow, device)
         : await this.pollStandardDevice(flow, device);
-      if (credential) {
-        await this.save(`oauth:${flow.providerId}`, credential);
+      if (result.credential) {
+        await this.saveFlowCredential(flow, result.credential);
         flow.status = "connected";
-        flow.detail = credential.email ? `Connected as ${credential.email}` : `${this.displayName(flow.providerId)} account connected`;
+        flow.detail = result.credential.email ? `Connected as ${result.credential.email}` : `${this.displayName(flow.providerId)} account connected`;
         return;
       }
-      intervalMs = Math.min(30_000, intervalMs + (flow.providerId === "nous" ? 0 : 0));
+      if (result.slowDown) intervalMs = nextDevicePollInterval(intervalMs, result.retryAfterMs);
     }
     if (flow.status === "pending") this.fail(flow, "Device sign-in timed out. Start again to receive a new code.");
   }
 
-  private async pollStandardDevice(flow: OAuthFlow, device: DeviceFlowData): Promise<StoredOAuthCredential | null> {
+  private async pollStandardDevice(flow: OAuthFlow, device: DeviceFlowData): Promise<DevicePollResult> {
     const url = device.kind === "kimi" ? `${KIMI_OAUTH_HOST}/api/oauth/token` : `${NOUS_BASE_URL}/api/oauth/token`;
     const values = { client_id: device.kind === "kimi" ? KIMI_CLIENT_ID : NOUS_CLIENT_ID, device_code: device.deviceCode, grant_type: "urn:ietf:params:oauth:grant-type:device_code" };
     const payload = await this.postDevice(url, values, requestHeaders(device.kind), flow.controller.signal);
     const error = stringValue(payload.error);
-    if (error === "authorization_pending" || error === "slow_down") return null;
+    if (error === "authorization_pending") return { credential: null, slowDown: false };
+    if (error === "slow_down") return { credential: null, slowDown: true, retryAfterMs: this.interval(payload, 0) || undefined };
     if (error === "expired_token" || error === "access_denied") throw new Error(`${this.displayName(flow.providerId)} device sign-in ${error.replace("_", " ")}`);
     if (error) throw new Error(`${this.displayName(flow.providerId)} device sign-in failed: ${error}`);
-    if (!stringValue(payload.access_token)) return null;
-    return asStored(flow.providerId, payload, stringValue(payload.refresh_token), device.kind === "nous" ? { apiBaseUrl: NOUS_INFERENCE_BASE_URL } : {});
+    if (!stringValue(payload.access_token)) return { credential: null, slowDown: false };
+    return {
+      credential: device.kind === "nous" ? asNousStored(payload) : asStored(flow.providerId, payload),
+      slowDown: false,
+    };
   }
 
-  private async pollGithub(flow: OAuthFlow, device: DeviceFlowData): Promise<StoredOAuthCredential | null> {
+  private async pollGithub(flow: OAuthFlow, device: DeviceFlowData): Promise<DevicePollResult> {
     const payload = await this.postDevice(GITHUB_TOKEN_URL, { client_id: GITHUB_CLIENT_ID, device_code: device.deviceCode, grant_type: "urn:ietf:params:oauth:grant-type:device_code" }, { "User-Agent": "openwordcode" }, flow.controller.signal);
     const error = stringValue(payload.error);
-    if (error === "authorization_pending" || error === "slow_down") return null;
+    if (error === "authorization_pending") return { credential: null, slowDown: false };
+    if (error === "slow_down") return { credential: null, slowDown: true, retryAfterMs: this.interval(payload, 0) || undefined };
     if (error === "expired_token" || error === "access_denied") throw new Error(`GitHub device sign-in ${error.replace("_", " ")}`);
     if (error) throw new Error(`GitHub device sign-in failed: ${error}`);
     const githubToken = stringValue(payload.access_token);
-    if (!githubToken) return null;
+    if (!githubToken) return { credential: null, slowDown: false };
     const exchanged = await this.exchangeCopilot(githubToken, flow.controller.signal);
-    return { ...exchanged, refreshToken: stringValue(payload.refresh_token) ?? githubToken };
+    return { credential: { ...exchanged, refreshToken: stringValue(payload.refresh_token) ?? githubToken }, slowDown: false };
   }
 
   private async postDevice(url: string, values: Record<string, string>, headers: Record<string, string>, signal: AbortSignal): Promise<TokenPayload & Record<string, unknown>> {
-    const response = await this.fetchImpl(url, { method: "POST", headers: { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded", ...headers }, body: new URLSearchParams(values).toString(), signal });
+    const response = await this.fetchImpl(url, { method: "POST", headers: { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded", ...headers }, body: new URLSearchParams(values).toString(), redirect: "error", signal: requestSignal(signal) });
     const payload = await readJson(response);
     if (!response.ok && !stringValue(payload.error)) throw new Error(`OAuth device poll failed (${response.status})`);
     return payload;
   }
 
   private async exchangeCopilot(githubToken: string, signal: AbortSignal): Promise<StoredOAuthCredential> {
-    const response = await this.fetchImpl(GITHUB_COPILOT_TOKEN_URL, { headers: { ...requestHeaders("github-copilot"), Accept: "application/json", Authorization: `token ${githubToken}` }, signal });
+    const response = await this.fetchImpl(GITHUB_COPILOT_TOKEN_URL, { headers: { ...requestHeaders("github-copilot"), Accept: "application/json", Authorization: `token ${githubToken}` }, redirect: "error", signal: requestSignal(signal) });
     const payload = await readJson(response);
     if (!response.ok) throw new Error(`GitHub Copilot token exchange failed (${response.status})`);
     const copilotToken = stringValue(payload.token);
     if (!copilotToken) throw new Error("GitHub Copilot token exchange did not return a token");
-    const identityResponse = await this.fetchImpl(GITHUB_USER_URL, { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${githubToken}`, "User-Agent": "openwordcode" }, signal });
-    const identity = await readJson(identityResponse);
+    const identityResponse = await this.fetchImpl(GITHUB_USER_URL, { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${githubToken}`, "User-Agent": "openwordcode", "X-GitHub-Api-Version": "2022-11-28" }, redirect: "error", signal: requestSignal(signal) });
+    const identity = identityResponse.ok ? await readJson(identityResponse) : {};
     const accountId = typeof identity.id === "number" ? String(identity.id) : stringValue(identity.login);
     const email = stringValue(identity.email);
     const apiBaseUrl = this.validateCopilotBase(stringValue(payload.endpoints && typeof payload.endpoints === "object" ? payload.endpoints.api : undefined));
@@ -769,22 +840,22 @@ export class ProviderOAuthManager {
   }
 
   private async discoverXai(signal: AbortSignal): Promise<{ authorize: string; token: string }> {
-    const response = await this.fetchImpl(XAI_DISCOVERY_URL, { headers: { Accept: "application/json" }, signal });
+    const response = await this.fetchImpl(XAI_DISCOVERY_URL, { headers: { Accept: "application/json" }, redirect: "error", signal: requestSignal(signal) });
     const payload = await readJson(response);
     const authorize = stringValue(payload.authorization_endpoint);
     const token = stringValue(payload.token_endpoint);
     if (!response.ok || !authorize || !token) throw new Error("xAI OAuth discovery did not return valid endpoints");
-    return { authorize, token };
+    return { authorize: validateXaiOAuthEndpoint(authorize), token: validateXaiOAuthEndpoint(token) };
   }
 
   private async discoverGoogleProject(accessToken: string, signal: AbortSignal): Promise<string | undefined> {
-    const headers = { Authorization: `Bearer ${accessToken}`, Accept: "*/*", "Content-Type": "application/json", "User-Agent": "antigravity/ide/2.5.5 (aidev_client; os_type=windows; arch=amd64)" };
-    const first = await this.fetchImpl(`${GOOGLE_CLOUD_CODE_API}/${GOOGLE_API_VERSION}:loadCodeAssist`, { method: "POST", headers, body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }), signal });
+    const headers = { Authorization: `Bearer ${accessToken}`, Accept: "*/*", "Content-Type": "application/json", "User-Agent": antigravityUserAgent(this.env) };
+    const first = await this.fetchImpl(`${GOOGLE_CLOUD_CODE_API}/${GOOGLE_API_VERSION}:loadCodeAssist`, { method: "POST", headers, body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }), redirect: "error", signal: requestSignal(signal) });
     const firstPayload = await readJson(first);
     const found = this.extractProject(firstPayload);
     if (found) return found;
     for (let attempt = 0; attempt < 3; attempt++) {
-      const response = await this.fetchImpl(`${GOOGLE_CLOUD_CODE_DAILY_API}/${GOOGLE_API_VERSION}:onboardUser`, { method: "POST", headers: { ...headers, "x-goog-api-client": "google-api-nodejs-client/10.3.0" }, body: JSON.stringify({ tier_id: "free-tier", metadata: { ide_type: "ANTIGRAVITY", ide_name: "antigravity", ide_version: "2.5.5" } }), signal });
+      const response = await this.fetchImpl(`${GOOGLE_CLOUD_CODE_DAILY_API}/${GOOGLE_API_VERSION}:onboardUser`, { method: "POST", headers, body: JSON.stringify({ tier_id: "free-tier", metadata: { ide_type: "ANTIGRAVITY", ide_name: "antigravity", ide_version: ANTIGRAVITY_IDE_VERSION } }), redirect: "error", signal: requestSignal(signal) });
       const payload = await readJson(response);
       const project = this.extractProject(payload.response && typeof payload.response === "object" ? payload.response as Record<string, unknown> : payload);
       if (project && (payload.done === true || response.ok)) return project;
@@ -825,7 +896,7 @@ export class ProviderOAuthManager {
       const response = await this.fetchImpl(`${NOUS_BASE_URL}/api/oauth/token`, { method: "POST", headers: { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded", "x-nous-refresh-token": refreshToken }, body: new URLSearchParams({ grant_type: "refresh_token", client_id: NOUS_CLIENT_ID }).toString(), signal });
       const payload = await readJson(response);
       if (!response.ok) throw new Error(`Nous OAuth refresh failed (${response.status})`);
-      refreshed = asStored(providerId, payload, undefined, { apiBaseUrl: NOUS_INFERENCE_BASE_URL });
+      refreshed = asNousStored(payload, refreshToken);
     } else {
       let githubToken = refreshToken;
       if (refreshToken.startsWith("ghr_")) {

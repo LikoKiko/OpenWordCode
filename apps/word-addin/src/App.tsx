@@ -574,6 +574,7 @@ export default function App(): JSX.Element {
       await streamAgent({
         providerId: selectedProviderId,
         modelId: selectedModelId,
+        effort: modelEffort,
         instruction: trimmed,
         mode,
         document: current,

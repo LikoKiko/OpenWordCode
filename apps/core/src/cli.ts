@@ -6,12 +6,14 @@ const port = Number(process.env.OPENWORDCODE_PORT ?? 10_200);
 const base = `http://127.0.0.1:${port}`;
 
 async function jsonRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const bootstrap = await fetch(`${base}/api/bootstrap`, { headers: { Origin: `http://127.0.0.1:${port}` } });
+  // Native CLI requests do not carry a browser Origin. This keeps alternate Core
+  // ports working while the server still rejects untrusted browser origins.
+  const bootstrap = await fetch(`${base}/api/bootstrap`);
   if (!bootstrap.ok) throw new Error(`Core bootstrap failed with HTTP ${bootstrap.status}`);
   const body = await bootstrap.json() as { sessionToken: string };
   const response = await fetch(`${base}${path}`, {
     ...init,
-    headers: { Origin: `http://127.0.0.1:${port}`, "x-openwordcode-session": body.sessionToken, "x-openwordcode-csrf": body.sessionToken, ...(init.headers ?? {}) },
+    headers: { "x-openwordcode-session": body.sessionToken, "x-openwordcode-csrf": body.sessionToken, ...(init.headers ?? {}) },
   });
   if (!response.ok) throw new Error(await response.text());
   return response.json() as Promise<T>;

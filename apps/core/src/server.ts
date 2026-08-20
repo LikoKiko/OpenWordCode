@@ -110,6 +110,7 @@ const skillsSchema = z.array(skillSchema).max(12);
 const agentSchema = z.object({
   providerId: bodyProviderId,
   modelId: z.string().trim().min(1).max(200),
+  effort: z.enum(["low", "medium", "high"]).optional(),
   instruction: z.string().trim().min(1).max(8_000),
   mode: z.enum(["manual", "auto", "skip"]),
   document: documentSchema,
@@ -516,6 +517,7 @@ export async function buildServer(state = createCoreState()): Promise<FastifyIns
       const result = await runAgent({
         provider,
         modelId: body.modelId,
+        effort: body.effort,
         instruction: body.instruction,
         mode: body.mode,
         document,

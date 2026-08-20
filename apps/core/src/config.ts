@@ -46,11 +46,44 @@ const settingsSchema = z.object({
 
 export type Settings = z.infer<typeof settingsSchema>;
 
+const SHIPPED_MODEL_MIGRATIONS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  anthropic: {
+    "claude-sonnet-4-6": "claude-sonnet-5",
+  },
+  google: {
+    "gemini-2.0-flash": "gemini-3.5-flash",
+  },
+  "google-antigravity": {
+    "gemini-3.7-flash-tiered": "gemini-3.7-flash",
+    "gemini-3.6-flash": "gemini-3.7-flash",
+    "gemini-3.6-flash-low": "gemini-3.7-flash",
+    "gemini-3.6-flash-medium": "gemini-3.7-flash",
+    "gemini-3.6-flash-high": "gemini-3.7-flash",
+    "gemini-3.5-flash-extra-low": "gemini-3.7-flash",
+    "gemini-3.5-flash-low": "gemini-3.7-flash",
+    "gemini-3.5-flash-mid": "gemini-3.7-flash",
+    "gemini-3.5-flash-high": "gemini-3.7-flash",
+    "gemini-3-flash-agent": "gemini-3.7-flash",
+    "gemini-3.1-pro-preview": "gemini-3.1-pro",
+    "gemini-3.1-pro-low": "gemini-3.1-pro",
+    "gemini-3.1-pro-high": "gemini-3.1-pro",
+    "gemini-pro-agent": "gemini-3.1-pro",
+  },
+  xai: {
+    "grok-4-1-fast-reasoning": "grok-4.5",
+  },
+};
+
+function migratedModelId(providerId: string, modelId: string | undefined): string | undefined {
+  if (!modelId) return modelId;
+  return SHIPPED_MODEL_MIGRATIONS[providerId]?.[modelId] ?? modelId;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function migratePersistedSettings(value: unknown): { value: unknown; changed: boolean } {
+function migratePersistedSettings(value: unknown, bridgeBaseUrl: string): { value: unknown; changed: boolean } {
   if (!isRecord(value) || !isRecord(value.providers)) return { value, changed: false };
   const providers: Record<string, unknown> = { ...value.providers };
   const legacy = providers["legacy-bridge"];
@@ -64,7 +97,7 @@ function migratePersistedSettings(value: unknown): { value: unknown; changed: bo
       id: "openwordcode-bridge",
       displayName: "OpenWordCode Bridge",
       kind: "openwordcode-bridge",
-      baseUrl: "http://127.0.0.1:10101/v1",
+      baseUrl: bridgeBaseUrl,
       enabled: true,
       local: true,
       auth: { method: "oauth", credentialRef: "provider:openwordcode-account" },
@@ -81,16 +114,17 @@ function migratePersistedSettings(value: unknown): { value: unknown; changed: bo
     providers.demo = { ...providers.demo, internal: true };
     changed = true;
   }
-  // Ollama and LM Studio were removed from the product. Drop them from older
-  // persisted configs so they do not reappear in the account list.
-  for (const removed of ["ollama", "lm-studio"]) {
+  // API-only and retired local providers are not part of the account-first
+  // product. Drop shipped legacy rows so they cannot reappear in Settings.
+  for (const removed of ["ollama", "lm-studio", "openai", "openrouter", "google"]) {
     if (providers[removed] !== undefined) {
       delete providers[removed];
       changed = true;
     }
   }
   const rawSelectedProviderId = typeof value.selectedProviderId === "string" ? value.selectedProviderId : "";
-  let selectedProviderId = rawSelectedProviderId === "legacy-bridge" || rawSelectedProviderId === "ollama" || rawSelectedProviderId === "lm-studio" || rawSelectedProviderId === "demo"
+  let selectedProviderId = rawSelectedProviderId === "legacy-bridge"
+    || ["ollama", "lm-studio", "openai", "openrouter", "google", "demo"].includes(rawSelectedProviderId)
     ? "openwordcode-bridge"
     : rawSelectedProviderId;
   let selectedModelId = typeof value.selectedModelId === "string" ? value.selectedModelId : undefined;
@@ -111,6 +145,29 @@ function migratePersistedSettings(value: unknown): { value: unknown; changed: bo
     selectedModelId = "gpt-5.6-luna";
     changed = true;
   }
+
+  const oauthAccountProviders: Readonly<Record<string, string>> = {
+    anthropic: "anthropic",
+    xai: "xai",
+    kimi: "kimi",
+  };
+  for (const [id, oauthProvider] of Object.entries(oauthAccountProviders)) {
+    const provider = providers[id];
+    if (!isRecord(provider) || !isRecord(provider.auth)) continue;
+    const auth = provider.auth;
+    if (auth.method === "oauth" && auth.oauthProvider === oauthProvider && auth.envVar === undefined && auth.credentialRef === undefined) continue;
+    const { envVar: _envVar, credentialRef: _credentialRef, ...safeAuth } = auth;
+    providers[id] = {
+      ...provider,
+      auth: {
+        ...safeAuth,
+        method: "oauth",
+        oauthProvider,
+        oauthCredentialRef: typeof auth.oauthCredentialRef === "string" ? auth.oauthCredentialRef : `oauth:${oauthProvider}`,
+      },
+    };
+    changed = true;
+  }
   return { value: { ...value, providers, selectedProviderId, selectedModelId }, changed };
 }
 
@@ -127,8 +184,8 @@ export function configPath(env: NodeJS.ProcessEnv = process.env): string { retur
 
 export function credentialPath(env: NodeJS.ProcessEnv = process.env): string { return join(dataDirectory(env), "credentials"); }
 
-export function defaultSettings(): Settings {
-  const providers = Object.fromEntries(defaultProviderConfigs().map(provider => [provider.id, provider]));
+export function defaultSettings(env: NodeJS.ProcessEnv = process.env): Settings {
+  const providers = Object.fromEntries(defaultProviderConfigs(env).map(provider => [provider.id, provider]));
   return {
     version: 1,
     selectedProviderId: "openwordcode-bridge",
@@ -141,18 +198,18 @@ export function defaultSettings(): Settings {
 }
 
 export function loadSettings(env: NodeJS.ProcessEnv = process.env): Settings {
-  const defaults = defaultSettings();
+  const defaults = defaultSettings(env);
   mkdirSync(dataDirectory(env), { recursive: true, mode: 0o700 });
   try {
     const parsed = JSON.parse(readFileSync(configPath(env), "utf8")) as unknown;
-    const migration = migratePersistedSettings(parsed);
+    const bridgeBaseUrl = defaults.providers["openwordcode-bridge"]?.baseUrl ?? "http://127.0.0.1:10101/v1";
+    const migration = migratePersistedSettings(parsed, bridgeBaseUrl);
     const validated = settingsSchema.safeParse(migration.value);
     if (!validated.success) return defaults;
     const providers: Record<string, ProviderConfig> = { ...defaults.providers, ...validated.data.providers };
     let changed = migration.changed;
-    // Existing installations keep their provider objects from the persisted
-    // config. Add newly shipped OAuth metadata without changing the user's
-    // selected auth method, API key reference, endpoint, or model choice.
+    // Existing installations keep endpoint and model choices for retained
+    // providers. Add newly shipped OAuth metadata where needed.
     for (const [id, defaultProvider] of Object.entries(defaults.providers)) {
       const existing = providers[id];
       if (!existing) continue;
@@ -172,12 +229,27 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env): Settings {
       if (id === "kimi" && existing.baseUrl === "https://api.moonshot.ai/v1") {
         next = { ...next, baseUrl: defaultProvider.baseUrl, displayName: defaultProvider.displayName, defaultModel: defaultProvider.defaultModel };
       }
+      // An explicit Bridge port is a process-level routing choice. It must win
+      // over a previously persisted default or Core and Bridge can both report
+      // healthy while requests are sent to the wrong local port.
+      if (id === "openwordcode-bridge" && env.OPENWORDCODE_BRIDGE_PORT?.trim() && existing.baseUrl !== defaultProvider.baseUrl) {
+        next = { ...next, baseUrl: defaultProvider.baseUrl };
+      }
+      const migratedDefaultModel = migratedModelId(id, existing.defaultModel);
+      if (migratedDefaultModel !== existing.defaultModel) {
+        next = { ...next, defaultModel: migratedDefaultModel };
+      }
       if (next !== existing) {
         providers[id] = next;
         changed = true;
       }
     }
-    const settings = { ...defaults, ...validated.data, providers };
+    let settings = { ...defaults, ...validated.data, providers };
+    const migratedSelectedModel = migratedModelId(settings.selectedProviderId, settings.selectedModelId);
+    if (migratedSelectedModel !== settings.selectedModelId) {
+      settings = { ...settings, selectedModelId: migratedSelectedModel };
+      changed = true;
+    }
     if (changed) saveSettings(settings, env);
     return settings;
   } catch {

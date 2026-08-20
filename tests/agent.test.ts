@@ -31,9 +31,11 @@ class ScriptedProvider implements ProviderRuntime {
 class GreetingProvider implements ProviderRuntime {
   readonly config = { id: "greeting-test", displayName: "Greeting Test", kind: "demo" as const, baseUrl: "demo://greeting-test", enabled: true, local: true, auth: { method: "none" as const }, privacyNote: "test" };
   toolCount = -1;
+  effort?: string;
   async listModels() { return []; }
   async *streamChat(request: ProviderChatRequest): AsyncGenerator<ProviderStreamEvent> {
     this.toolCount = request.tools?.length ?? 0;
+    this.effort = request.effort;
     yield { type: "text", delta: "Hi! How can I help with your Word document?" };
     yield { type: "done" };
   }
@@ -95,8 +97,9 @@ describe("agent runtime", () => {
 
   it("does not expose document tools for ordinary conversation", async () => {
     const provider = new GreetingProvider();
-    const result = await runAgent({ provider, modelId: "test", instruction: "hi", mode: "manual", document });
+    const result = await runAgent({ provider, modelId: "test", instruction: "hi", mode: "manual", effort: "high", document });
     expect(provider.toolCount).toBe(0);
+    expect(provider.effort).toBe("high");
     expect(result.answer).toBe("Hi! How can I help with your Word document?");
   });
 

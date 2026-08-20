@@ -6,15 +6,17 @@ Provider adapters implement the same `listModels()` and `streamChat()` contract.
 
 | Provider | Transport | Default endpoint | Auth |
 | --- | --- | --- | --- |
-| OpenAI | OpenAI-compatible | `https://api.openai.com/v1` | Use OpenWordCode Bridge with Codex CLI |
+| OpenWordCode Bridge | OpenAI-compatible loopback | `http://127.0.0.1:10101/v1` | Codex CLI or OpenWordCode account session |
 | Anthropic | Messages API | `https://api.anthropic.com/v1` | Claude Code CLI or OAuth |
-| OpenRouter | OpenAI-compatible | `https://openrouter.ai/api/v1` | No public account connector |
-| Google Gemini | Gemini REST | `https://generativelanguage.googleapis.com/v1beta` | Use Google Antigravity CLI/OAuth |
+| Google Antigravity | Cloud Code Assist | `https://daily-cloudcode-pa.googleapis.com` | Antigravity CLI or Google OAuth |
 | xAI | OpenAI-compatible | `https://api.x.ai/v1` | OAuth |
 | Kimi Code | OpenAI-compatible | `https://api.kimi.com/coding/v1` | Kimi CLI or OAuth |
-Provider endpoints are configurable through the Core API. Model discovery is live and bounded; disconnected providers do not prevent the rest of the UI from loading. Legacy API-key/environment transports remain available to existing Core configurations, but the public Word task pane does not expose them.
+| Nous Portal | OpenAI-compatible | `https://inference-api.nousresearch.com/v1` | Device OAuth |
+| GitHub Copilot | Copilot API | `https://api.githubcopilot.com` | GitHub device OAuth |
 
-Account and CLI connector details are documented in [`AUTHENTICATION.md`](AUTHENTICATION.md). Custom OpenAI-compatible endpoints, including locally hosted ones, can still be added through the Core provider API.
+Model discovery is live and bounded; disconnected providers do not prevent the rest of the UI from loading. Fresh installs expose only account or official-CLI connectors. The public Word task pane has no API-key entry flow.
+
+Account and CLI connector details are documented in [`AUTHENTICATION.md`](AUTHENTICATION.md).
 
 Kimi Code OAuth and the Kimi Code endpoint are separate from the Moonshot API
 surface. Provider-specific OAuth details and limitations are documented in

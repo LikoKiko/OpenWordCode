@@ -26,8 +26,8 @@ project, another application's proxy, browser cookies, or credential files.
 - Apply approved edits through the Office adapter with stale-target checks and
   tracked-change-friendly behavior.
 - Attach images and PDFs for providers that support multimodal input.
-- Use the OpenWordCode Bridge, supported provider OAuth/CLI sessions, or local
-  models. The Word task pane does not expose API-key entry.
+- Use the OpenWordCode Bridge or supported provider OAuth/CLI sessions. The
+  Word task pane does not expose API-key entry.
 - Search the web when enabled and inspect a bounded local workspace through the
   read-only console tool.
 - Keep provider credentials in the local Core credential store instead of the
@@ -44,8 +44,8 @@ For the real add-in workflow:
 - Windows 10 or Windows 11.
 - Microsoft Word Desktop with Office Add-ins enabled.
 - Node.js 20 or newer and npm.
-- A supported account connection or a local model. Cloud sign-in is handled by
-  the OpenWordCode Bridge, OAuth, or an official provider CLI session.
+- A supported account connection. Cloud sign-in is handled by the OpenWordCode
+  Bridge, OAuth, or an official provider CLI session.
 
 The browser preview and automated tests can run without Microsoft Word, but
 they use the in-memory Word adapter and cannot validate a live document.
@@ -72,11 +72,9 @@ The development processes listen on:
 Open `https://localhost:3000` once in a browser and trust the local development
 certificate if your browser asks. Leave `npm run dev` running while testing.
 
-The public task pane is account-first: choose the OpenWordCode Bridge, a
-provider with OAuth/CLI support, or a local model. It intentionally does not
-show an API-key field. Existing Core configurations may continue to resolve
-legacy credentials for backward compatibility, but new users connect through
-an account or local runtime.
+The public task pane is account-first: choose the OpenWordCode Bridge or a
+provider with OAuth/CLI support. It intentionally does not show an API-key
+field, and fresh installs do not include API-only providers.
 
 ## Sideload into Word Desktop
 
@@ -105,7 +103,7 @@ Copy `.env.example` to `.env` only for local development. The file is ignored
 by Git. Never place real credentials in source, screenshots, issues, tests, or
 pull requests.
 
-### Local models and account connections
+### Account connections
 
 The built-in providers include the OpenWordCode Bridge, Anthropic, Google
 Antigravity, xAI, Kimi Code, Nous, and GitHub Copilot. The public Word UI
@@ -122,9 +120,10 @@ provider password and tokens remain in the local Core credential store.
 The OpenWordCode account/Bridge sign-in requires an OAuth client registration
 owned by the OpenWordCode deployment. Set
 `OPENWORDCODE_OPENAI_OAUTH_CLIENT_ID` only after registering that client and
-adding the localhost callback. Google Antigravity sign-in also requires a
-provider-approved `GOOGLE_ANTIGRAVITY_CLIENT_SECRET` in the Core environment.
-Neither value belongs in GitHub.
+adding the localhost callback. Google Antigravity uses the bundled installed-app
+public client by default; deployment owners can override that registration
+through the documented environment variables. User tokens never belong in
+GitHub.
 
 If a user already has ChatGPT access through Codex CLI, select the OpenWordCode
 Bridge in Word and choose **Sign in with Codex CLI**. OpenWordCode starts the

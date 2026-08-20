@@ -299,6 +299,7 @@ function documentTools(options: AgentRuntimeOptions): RegisteredTool[] {
 export interface AgentRuntimeOptions {
   provider: ProviderRuntime;
   modelId: string;
+  effort?: string;
   instruction: string;
   mode: AgentMode;
   document: DocumentSnapshot;
@@ -686,7 +687,7 @@ export async function runAgent(options: AgentRuntimeOptions): Promise<AgentResul
     const returnedTools: ToolCall[] = [];
     let pendingDisplay = "";
     let displayStarted = false;
-    for await (const event of options.provider.streamChat({ model: options.modelId, messages, tools: toolLimitReached ? [] : toolDefinitions, signal: options.signal, ...(providerAttachments.length ? { attachments: providerAttachments } : {}) })) {
+    for await (const event of options.provider.streamChat({ model: options.modelId, messages, tools: toolLimitReached ? [] : toolDefinitions, effort: options.effort, signal: options.signal, ...(providerAttachments.length ? { attachments: providerAttachments } : {}) })) {
       if (event.type === "text") {
         assistantText += event.delta;
         pendingDisplay += event.delta;

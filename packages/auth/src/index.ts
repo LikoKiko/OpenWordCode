@@ -4,9 +4,14 @@ import { dirname, join } from "node:path";
 
 export interface CredentialStore {
   get(id: string): Promise<string | null>;
-  set(id: string, secret: string): Promise<void>;
+  set(id: string, secret: string, options?: CredentialWriteOptions): Promise<void>;
   remove(id: string): Promise<void>;
   kind: "encrypted-file" | "memory";
+}
+
+export interface CredentialWriteOptions {
+  /** Runs at the final synchronous persistence boundary. Throw to discard a stale write. */
+  assertBeforePersist?: () => void;
 }
 
 interface EncryptedEntry {
@@ -50,7 +55,7 @@ export class EncryptedFileCredentialStore implements CredentialStore {
     }
   }
 
-  async set(id: string, secret: string): Promise<void> {
+  async set(id: string, secret: string, options: CredentialWriteOptions = {}): Promise<void> {
     if (!id || !secret || /[\r\n]/.test(secret)) throw new Error("credential must be a non-empty single-line secret");
     const iv = randomBytes(12);
     const cipher = createCipheriv("aes-256-gcm", this.key(), iv);
@@ -61,6 +66,7 @@ export class EncryptedFileCredentialStore implements CredentialStore {
       tag: cipher.getAuthTag().toString("base64url"),
       ciphertext: ciphertext.toString("base64url"),
     };
+    options.assertBeforePersist?.();
     this.writeFile(file);
   }
 
@@ -108,7 +114,10 @@ export class MemoryCredentialStore implements CredentialStore {
   readonly kind = "memory" as const;
   private readonly values = new Map<string, string>();
   async get(id: string): Promise<string | null> { return this.values.get(id) ?? null; }
-  async set(id: string, secret: string): Promise<void> { this.values.set(id, secret); }
+  async set(id: string, secret: string, options: CredentialWriteOptions = {}): Promise<void> {
+    options.assertBeforePersist?.();
+    this.values.set(id, secret);
+  }
   async remove(id: string): Promise<void> { this.values.delete(id); }
 }
 
