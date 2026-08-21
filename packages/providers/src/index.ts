@@ -52,16 +52,39 @@ function arrayValue(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
 }
 
-function providerResponseError(config: ProviderConfig, response: Response): ProviderError {
+function responseErrorDetail(payloadText: string): string | undefined {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(payloadText) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (!isObject(payload)) return undefined;
+  const error = isObject(payload.error) ? payload.error : payload;
+  const message = stringValue(error.message) ?? stringValue(error.detail) ?? stringValue(error.reason);
+  if (!message?.trim()) return undefined;
+  const type = stringValue(error.type) ?? stringValue(error.code);
+  const detail = type?.trim() ? `${type.trim()}: ${message.trim()}` : message.trim();
+  return detail
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/giu, "Bearer [redacted]")
+    .replace(/\b(?:sk|key|token)[-_]?[A-Za-z0-9._-]{12,}\b/giu, "[redacted]")
+    .replace(/\s+/gu, " ")
+    .slice(0, 400);
+}
+
+function providerResponseError(config: ProviderConfig, response: Response, detail?: string): ProviderError {
   const status = response.status;
-  if (status === 401 || status === 403) return new ProviderError("auth_invalid", `${config.displayName} rejected the configured authentication`, status);
-  if (status === 429) return new ProviderError("rate_limited", `${config.displayName} rate-limited the request`, status);
-  return new ProviderError("provider_http_error", `${config.displayName} returned HTTP ${status}`, status);
+  const suffix = detail ? `: ${detail}` : "";
+  if (status === 401 || status === 403) return new ProviderError("auth_invalid", `${config.displayName} rejected the configured authentication${suffix}`, status);
+  if (status === 429) return new ProviderError("rate_limited", `${config.displayName} rate-limited the request${suffix}`, status);
+  return new ProviderError("provider_http_error", `${config.displayName} returned HTTP ${status}${suffix}`, status);
 }
 
 async function requireResponse(config: ProviderConfig, response: Response): Promise<Response> {
   if (response.ok) return response;
-  throw providerResponseError(config, response);
+  let body = "";
+  try { body = await response.text(); } catch { /* preserve the status error when the body cannot be read */ }
+  throw providerResponseError(config, response, responseErrorDetail(body));
 }
 
 async function parseJson(response: Response): Promise<unknown> {
@@ -250,7 +273,46 @@ function attachmentBase64(dataUrl: string): string {
   return separator >= 0 ? dataUrl.slice(separator + 1) : dataUrl;
 }
 
+function attachmentText(file: ChatAttachment): string {
+  const encoded = attachmentBase64(file.dataUrl);
+  try {
+    return Buffer.from(encoded, "base64").toString("utf8");
+  } catch {
+    return "";
+  }
+}
+
+function textAttachmentBlock(file: ChatAttachment): string {
+  return `[Attached text file: ${file.name}]\n${attachmentText(file)}\n[End attached text file]`;
+}
+
 const ANTHROPIC_SYSTEM_IDENTITY = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+
+function anthropicToolName(name: string, oauth: boolean): string {
+  if (!oauth) return name;
+  return name.startsWith("custom_") ? name : `custom_${name}`;
+}
+
+function anthropicSessionId(token: string): string {
+  const hash = createHash("sha256").update(`claude-code-session:${token}`, "utf8").digest("hex");
+  const variant = ((parseInt(hash[16] ?? "0", 16) & 0x3) | 0x8).toString(16);
+  return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-${variant}${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
+}
+
+function anthropicToolUseId(rawId: string, oauth: boolean): string {
+  if (!oauth) return rawId;
+  const normalized = rawId.trim().replace(/[^A-Za-z0-9_-]/gu, "_");
+  if (/^toolu_[A-Za-z0-9_-]{1,120}$/u.test(normalized)) return normalized;
+  const digest = createHash("sha256").update(rawId || randomUUID(), "utf8").digest("hex").slice(0, 24);
+  return `toolu_${digest}`;
+}
+
+function normalizeAnthropicInputSchema(schema: unknown): JsonObject {
+  const normalized = isObject(schema) ? { ...schema } : {};
+  if (normalized.type !== "object") normalized.type = "object";
+  if (!isObject(normalized.properties)) normalized.properties = {};
+  return normalized;
+}
 
 function lastUserMessage(messages: ChatMessage[]): ChatMessage | undefined {
   return [...messages].reverse().find(message => message.role === "user");
@@ -260,19 +322,23 @@ function openAiMessageContent(message: ChatMessage, attachments: ChatAttachment[
   if (!includeAttachments || !attachments.length) return message.content;
   return [
     { type: "text", text: message.content },
-    ...attachments.map(file => file.mimeType.startsWith("image/")
-      ? { type: "image_url", image_url: { url: file.dataUrl } }
-      : { type: "file", file: { filename: file.name, file_data: file.dataUrl } }),
+    ...attachments.map(file => file.mimeType === "text/plain"
+      ? { type: "text", text: textAttachmentBlock(file) }
+      : file.mimeType.startsWith("image/")
+        ? { type: "image_url", image_url: { url: file.dataUrl } }
+        : { type: "file", file: { filename: file.name, file_data: file.dataUrl } }),
   ];
 }
 
 function anthropicMessageContent(message: ChatMessage, attachments: ChatAttachment[], includeAttachments: boolean): unknown {
   if (!includeAttachments || !attachments.length) return message.content;
   return [
-    { type: "text", text: message.content },
-    ...attachments.map(file => file.mimeType.startsWith("image/")
-      ? { type: "image", source: { type: "base64", media_type: file.mimeType, data: attachmentBase64(file.dataUrl) } }
-      : { type: "document", source: { type: "base64", media_type: file.mimeType, data: attachmentBase64(file.dataUrl) }, title: file.name }),
+    { type: "text", text: message.content || "(empty)" },
+    ...attachments.map(file => file.mimeType === "text/plain"
+      ? { type: "text", text: textAttachmentBlock(file) }
+      : file.mimeType.startsWith("image/")
+        ? { type: "image", source: { type: "base64", media_type: file.mimeType, data: attachmentBase64(file.dataUrl) } }
+        : { type: "document", source: { type: "base64", media_type: file.mimeType, data: attachmentBase64(file.dataUrl) }, title: file.name }),
   ];
 }
 
@@ -280,30 +346,72 @@ function geminiMessageParts(message: ChatMessage, attachments: ChatAttachment[],
   if (!includeAttachments || !attachments.length) return [{ text: message.content }];
   return [
     { text: message.content },
-    ...attachments.map(file => ({ inline_data: { mime_type: file.mimeType, data: attachmentBase64(file.dataUrl) } })),
+    ...attachments.map(file => file.mimeType === "text/plain"
+      ? { text: textAttachmentBlock(file) }
+      : { inline_data: { mime_type: file.mimeType, data: attachmentBase64(file.dataUrl) } }),
   ];
 }
 
 function anthropicMessages(messages: ChatMessage[], attachments: ChatAttachment[], oauth = false): unknown[] {
   const lastUser = lastUserMessage(messages);
-  return messages
-    .filter(message => message.role !== "system")
-    .map(message => {
-      if (message.role === "assistant") {
-        const content: unknown[] = [];
-        if (message.content) content.push({ type: "text", text: message.content });
-        for (const call of message.toolCalls ?? []) {
-          let input: unknown = {};
-          try { input = JSON.parse(call.arguments) as unknown; } catch { /* keep an empty object for malformed provider arguments */ }
-          content.push({ type: "tool_use", id: call.id, name: oauth ? `custom_${call.name}` : call.name, input });
+  const toolIdMap = new Map<string, string>();
+  const toolIdFor = (rawId: string): string => {
+    if (!oauth) return rawId;
+    const existing = toolIdMap.get(rawId);
+    if (existing) return existing;
+    const normalized = anthropicToolUseId(rawId, oauth);
+    toolIdMap.set(rawId, normalized);
+    return normalized;
+  };
+  const wireMessages: JsonObject[] = [];
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index]!;
+    if (message.role === "system") continue;
+    if (message.role === "assistant") {
+      const content: unknown[] = [];
+      if (message.content) content.push({ type: "text", text: message.content });
+      for (const call of message.toolCalls ?? []) {
+        let input: unknown = {};
+        try { input = JSON.parse(call.arguments) as unknown; } catch { /* keep an empty object for malformed provider arguments */ }
+        content.push({
+          type: "tool_use",
+          id: toolIdFor(call.id),
+          name: anthropicToolName(call.name, oauth),
+          input: isObject(input) ? input : { value: input },
+        });
+      }
+      // Empty assistant messages are invalid Anthropic content blocks. They can occur when the
+      // agent produced only a tool call, or when a prior provider returned an empty turn.
+      if (content.length) wireMessages.push({ role: "assistant", content });
+      continue;
+    }
+    if (message.role === "tool") {
+      // Anthropic expects all results for one assistant tool turn in the same following user
+      // message. Group consecutive tool messages instead of emitting several user turns.
+      const blocks: unknown[] = [];
+      let next = index;
+      while (next < messages.length && messages[next]?.role === "tool") {
+        const result = messages[next]!;
+        if (result.toolCallId) {
+          blocks.push({ type: "tool_result", tool_use_id: toolIdFor(result.toolCallId), content: result.content || "(empty tool output)" });
+        } else {
+          blocks.push({ type: "text", text: result.content || "(orphan tool output)" });
         }
-        return { role: "assistant", content: content.length ? content : [{ type: "text", text: "" }] };
+        next += 1;
       }
-      if (message.role === "tool") {
-        return { role: "user", content: [{ type: "tool_result", tool_use_id: message.toolCallId ?? "unknown-tool", content: message.content }] };
-      }
-      return { role: "user", content: anthropicMessageContent(message, attachments, message === lastUser) };
-    });
+      wireMessages.push({ role: "user", content: blocks.length ? blocks : "(empty tool output)" });
+      index = next - 1;
+      continue;
+    }
+    const content = anthropicMessageContent(message, attachments, message === lastUser);
+    wireMessages.push({ role: "user", content: typeof content === "string" && !content ? "(empty)" : content });
+  }
+
+  // Claude models reject assistant-prefill histories. This also makes a fresh request valid if
+  // the previous turn ended immediately after a tool call or an interrupted assistant turn.
+  const last = wireMessages.at(-1);
+  if (!last || last.role === "assistant") wireMessages.push({ role: "user", content: "(continue)" });
+  return wireMessages;
 }
 
 function jsonValue(value: string): unknown {
@@ -359,6 +467,7 @@ function geminiContents(messages: ChatMessage[], attachments: ChatAttachment[]):
 }
 
 function responsesAttachmentContent(file: ChatAttachment): JsonObject {
+  if (file.mimeType === "text/plain") return { type: "input_text", text: textAttachmentBlock(file) };
   if (file.mimeType.startsWith("image/")) return { type: "input_image", image_url: file.dataUrl };
   return { type: "input_file", filename: file.name, file_data: file.dataUrl };
 }
@@ -882,8 +991,12 @@ export class AnthropicProvider implements ProviderRuntime {
         "X-Stainless-Runtime": "node",
         "X-Stainless-Lang": "js",
         "X-Stainless-Timeout": "600",
+        "X-Stainless-Arch": process.arch,
+        "X-Stainless-OS": process.platform,
         "X-Stainless-Package-Version": "0.74.0",
-        "X-Claude-Code-Session-Id": `openwordcode-${credential.token.slice(0, 24)}`,
+        "X-Stainless-Runtime-Version": process.version.slice(1),
+        "X-Claude-Code-Session-Id": anthropicSessionId(credential.token),
+        "x-client-request-id": randomUUID(),
       });
     } else {
       headers["x-api-key"] = credential.token;
@@ -910,10 +1023,23 @@ export class AnthropicProvider implements ProviderRuntime {
     const oauth = this.oauthMode();
     const messages = anthropicMessages(request.messages, request.attachments ?? [], oauth);
     const system = request.messages.filter(message => message.role === "system").map(message => message.content).join("\n\n");
-    const tools = request.tools?.map(tool => ({ name: oauth ? `custom_${tool.function.name}` : tool.function.name, description: tool.function.description, input_schema: tool.function.parameters })) ?? [];
-    const body: JsonObject = { model: request.model, max_tokens: 4096, stream: true, messages };
-    if (oauth) body.system = [ANTHROPIC_SYSTEM_IDENTITY, ...(system ? [system] : [])].join("\n\n");
-    else if (system) body.system = system;
+    const tools = request.tools?.map(tool => ({
+      name: anthropicToolName(tool.function.name, oauth),
+      description: tool.function.description,
+      input_schema: normalizeAnthropicInputSchema(tool.function.parameters),
+    })) ?? [];
+    const body: JsonObject = { model: request.model, max_tokens: 8192, stream: true, messages };
+    if (oauth) {
+      // Claude account OAuth follows Claude Code's system block contract. A joined string can
+      // authenticate successfully but still be rejected as an invalid request when tools are
+      // present or the model is using the account transport.
+      body.system = [
+        { type: "text", text: ANTHROPIC_SYSTEM_IDENTITY },
+        ...(system ? [{ type: "text", text: system }] : []),
+      ];
+    } else if (system) {
+      body.system = [{ type: "text", text: system }];
+    }
     if (tools.length) body.tools = tools;
     const response = await this.fetchImpl(`${normalizeBaseUrl(this.config.baseUrl)}/messages`, {
       method: "POST",

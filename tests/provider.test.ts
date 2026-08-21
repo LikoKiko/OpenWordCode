@@ -23,7 +23,7 @@ describe("OpenAI-compatible provider", () => {
     const provider = createProvider({ id: "test", displayName: "Test", kind: "openai-compatible", baseUrl: "http://127.0.0.1:9999/v1", enabled: true, local: true, auth: { method: "api-key", credentialRef: "provider:test" }, privacyNote: "test" }, { store, fetchImpl });
     expect((await provider.listModels())[0]?.id).toBe("model-a");
     const events = [];
-    for await (const event of provider.streamChat({ model: "model-a", effort: "high", messages: [{ role: "user", content: "Review these files" }], attachments: [{ id: "image-1", name: "chart.png", mimeType: "image/png", size: 1, dataUrl: "data:image/png;base64,AA==" }, { id: "pdf-1", name: "brief.pdf", mimeType: "application/pdf", size: 1, dataUrl: "data:application/pdf;base64,AA==" }] })) events.push(event);
+    for await (const event of provider.streamChat({ model: "model-a", effort: "high", messages: [{ role: "user", content: "Review these files" }], attachments: [{ id: "image-1", name: "chart.png", mimeType: "image/png", size: 1, dataUrl: "data:image/png;base64,AA==" }, { id: "pdf-1", name: "brief.pdf", mimeType: "application/pdf", size: 1, dataUrl: "data:application/pdf;base64,AA==" }, { id: "text-1", name: "request.txt", mimeType: "text/plain", size: 4, dataUrl: "data:text/plain;base64,VGVzdA==" }] })) events.push(event);
     expect(events.some(event => event.type === "text" && event.delta === "hello")).toBe(true);
     expect(seen.every(request => request.headers.get("authorization") === "Bearer provider-secret")).toBe(true);
     const chatBody = JSON.parse(await seen[1]!.text()) as { messages: Array<{ content: unknown }>; reasoning_effort?: string };
@@ -32,6 +32,7 @@ describe("OpenAI-compatible provider", () => {
       { type: "text", text: "Review these files" },
       { type: "image_url", image_url: { url: "data:image/png;base64,AA==" } },
       { type: "file", file: { filename: "brief.pdf", file_data: "data:application/pdf;base64,AA==" } },
+      { type: "text", text: "[Attached text file: request.txt]\nTest\n[End attached text file]" },
     ]);
   });
 
@@ -224,6 +225,56 @@ describe("native tool providers", () => {
     });
     expect((await provider.listModels()).map(model => model.id)).toEqual(expect.arrayContaining(["claude-sonnet-5", "claude-opus-5", "claude-haiku-4-5"]));
     expect(fetchCount).toBe(0);
+  });
+
+  it("builds Claude OAuth requests with the Claude Code system blocks and client fingerprint", async () => {
+    let request: Request | undefined;
+    const provider = createProvider({ id: "anthropic-oauth-test", displayName: "Anthropic OAuth Test", kind: "anthropic", baseUrl: "https://api.anthropic.com/v1", enabled: true, local: false, auth: { method: "oauth", oauthProvider: "anthropic", oauthCredentialRef: "oauth:anthropic" }, privacyNote: "test" }, {
+      store: new MemoryCredentialStore(),
+      oauth: async () => ({ accessToken: "claude-oauth-token" }),
+      fetchImpl: async (input, init) => {
+        request = new Request(input, init);
+        return new Response('data: {"type":"message_stop"}\n\n', { headers: { "content-type": "text/event-stream" } });
+      },
+    });
+    for await (const _event of provider.streamChat({
+      model: "claude-sonnet-5",
+      messages: [
+        { role: "system", content: "Use the document context when needed." },
+        { role: "user", content: "Inspect the document" },
+      ],
+      tools: [{ type: "function", function: { name: "custom_run_console", description: "Inspect safely", parameters: { type: "string" } } }],
+    })) { /* drain */ }
+
+    const body = JSON.parse(await request!.text()) as {
+      system?: Array<{ type?: string; text?: string }>;
+      messages?: Array<{ role?: string; content?: unknown }>;
+      tools?: Array<{ name?: string; input_schema?: Record<string, unknown> }>;
+    };
+    expect(body.system?.[0]).toEqual({ type: "text", text: "You are a Claude agent, built on Anthropic's Claude Agent SDK." });
+    expect(body.system?.[1]).toEqual({ type: "text", text: "Use the document context when needed." });
+    expect(body.tools?.[0]?.name).toBe("custom_run_console");
+    expect(body.tools?.[0]?.input_schema).toEqual({ type: "object", properties: {} });
+    expect(body.messages?.at(-1)?.role).toBe("user");
+    expect(request!.headers.get("authorization")).toBe("Bearer claude-oauth-token");
+    expect(request!.headers.get("x-client-request-id")).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(request!.headers.get("x-claude-code-session-id")).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(request!.headers.get("x-stainless-arch")).toBeTruthy();
+    expect(request!.headers.get("x-stainless-os")).toBeTruthy();
+  });
+
+  it("keeps the upstream Anthropic reason when a request is rejected", async () => {
+    const store = new MemoryCredentialStore();
+    await store.set("provider:anthropic-error-test", "anthropic-secret");
+    const provider = createProvider({ id: "anthropic-error-test", displayName: "Anthropic Error Test", kind: "anthropic", baseUrl: "https://api.anthropic.com/v1", enabled: true, local: false, auth: { method: "api-key", credentialRef: "provider:anthropic-error-test" }, privacyNote: "test" }, {
+      store,
+      fetchImpl: async () => new Response(JSON.stringify({ error: { type: "invalid_request_error", message: "model is not available for this account" } }), { status: 400, headers: { "content-type": "application/json" } }),
+    });
+    await expect(provider.listModels()).rejects.toMatchObject({
+      code: "provider_http_error",
+      status: 400,
+      message: "Anthropic Error Test returned HTTP 400: invalid_request_error: model is not available for this account",
+    });
   });
 
   it("sends Gemini function declarations and returns streamed function calls", async () => {

@@ -6,6 +6,7 @@ import {
   CheckCircle,
   CircleNotch,
   Clock,
+  Copy,
   FastForward,
   FileText,
   Hand,
@@ -17,11 +18,13 @@ import {
   UploadSimple,
   X,
   Warning,
+  ArrowCounterClockwise,
 } from "@phosphor-icons/react";
-import type { AgentAction, AgentMode, ChatAttachment, ModelInfo, SkillSummary } from "../../../packages/shared/src/index.js";
+import type { AgentAction, AgentMode, AgentQuestion, ChatAttachment, ModelInfo, ProposedChange, ProviderSummary, SkillSummary } from "../../../packages/shared/src/index.js";
+import { formatTokenCount } from "../../../packages/shared/src/index.js";
 
 export type AttachmentPreview = Omit<ChatAttachment, "dataUrl"> & { dataUrl?: string };
-export type AppliedEdit = { id: string; description: string; before?: string; after?: string };
+export type AppliedEdit = { id: string; description: string; before?: string; after?: string; change?: ProposedChange };
 
 const LOADER_PATTERNS = {
   Drive: [0, 90, 180, 90, 180, 270, 180, 270, 360],
@@ -55,6 +58,29 @@ export function LoadingState({ label = "Working", variant = "Drive" }: { label?:
   );
 }
 
+export function ContextMeter({ usedTokens, contextWindow, estimated, compacted, summarizedMessages = 0 }: { usedTokens: number; contextWindow: number; estimated?: boolean; compacted?: boolean; summarizedMessages?: number }): JSX.Element {
+  const safeWindow = Math.max(1, contextWindow);
+  const ratio = Math.min(1, Math.max(0, usedTokens / safeWindow));
+  const percent = Math.round(ratio * 100);
+  const percentLabel = ratio > 0 && percent === 0 ? "<1%" : `${percent}%`;
+  const circumference = 2 * Math.PI * 15;
+  const tone = percent >= 90 ? "critical" : percent >= 72 ? "warning" : "steady";
+  const detail = `Approximate request context: ~${formatTokenCount(usedTokens)} of ${estimated ? "about " : ""}${formatTokenCount(safeWindow)} tokens${compacted ? ` · compacted ${summarizedMessages} older messages` : ""}`;
+  return (
+    <div className={`context-meter ${tone}`} role="status" aria-label={`Context usage: ${detail}`} title={detail}>
+      <span className="context-ring" aria-hidden="true">
+        <svg viewBox="0 0 36 36" focusable="false">
+          <circle className="context-ring-track" cx="18" cy="18" r="15" />
+          <circle className="context-ring-value" cx="18" cy="18" r="15" style={{ strokeDasharray: circumference, strokeDashoffset: circumference * (1 - ratio) }} />
+        </svg>
+        <span>{percentLabel}</span>
+      </span>
+      <span className="context-meter-copy"><strong>Context</strong><small>~{formatTokenCount(usedTokens)} / {estimated ? "~" : ""}{formatTokenCount(safeWindow)}</small></span>
+      {compacted ? <span className="context-meter-note">Auto compacted</span> : null}
+    </div>
+  );
+}
+
 export function ThinkingTrace({ active, activity, steps = ["Reading document context", "Preparing a focused response"] }: { active: boolean; activity?: string; steps?: string[] }): JSX.Element {
   const [expanded, setExpanded] = useState(false);
   const label = active ? activity || "Working" : "Response ready";
@@ -82,7 +108,96 @@ function editPreview(value: string, max = 220): string {
   return normalized.length > max ? `${normalized.slice(0, max).trimEnd()}…` : normalized;
 }
 
-export function AppliedEditList({ edits }: { edits: AppliedEdit[] }): JSX.Element {
+export function CopyAnswerButton({ content, disabled = false }: { content: string; disabled?: boolean }): JSX.Element {
+  const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
+
+  const copy = async (): Promise<void> => {
+    if (disabled || !content) return;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(content);
+      } else {
+        const textarea = document.createElement("textarea");
+        textarea.value = content;
+        textarea.setAttribute("readonly", "true");
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        const copied = document.execCommand("copy");
+        textarea.remove();
+        if (!copied) throw new Error("Clipboard access was not available");
+      }
+      setState("copied");
+      window.setTimeout(() => setState("idle"), 1_500);
+    } catch {
+      setState("failed");
+      window.setTimeout(() => setState("idle"), 1_800);
+    }
+  };
+
+  return <button className="message-action-button" type="button" onClick={() => void copy()} disabled={disabled} aria-label={state === "copied" ? "Answer copied" : "Copy answer"} title={state === "failed" ? "Could not copy answer" : state === "copied" ? "Copied" : "Copy answer"}>
+    {state === "copied" ? <Check size={12} weight="bold" /> : <Copy size={12} />}
+    <span>{state === "copied" ? "Copied" : state === "failed" ? "Copy failed" : "Copy"}</span>
+  </button>;
+}
+
+export function AskUserQuestionCard({ question, submitting = false, onSubmit }: { question: AgentQuestion; submitting?: boolean; onSubmit: (answer: string) => void }): JSX.Element {
+  const [selected, setSelected] = useState("");
+  const [other, setOther] = useState("");
+  const answer = other.trim() || selected;
+
+  useEffect(() => {
+    setSelected("");
+    setOther("");
+  }, [question.id]);
+
+  const submit = (): void => {
+    if (!answer || submitting) return;
+    onSubmit(answer);
+  };
+
+  return (
+    <section className="ask-question-card" aria-live="polite">
+      <div className="ask-question-heading">
+        <span className="ask-question-kicker">{question.header || "OpenWordCode asks"}</span>
+        <span className="ask-question-status">{submitting ? "Sending…" : "Needs your input"}</span>
+      </div>
+      <p className="ask-question-prompt">{question.question}</p>
+      <div className="ask-question-options" role="group" aria-label="Answer options">
+        {question.options.map(option => (
+          <button
+            key={option.label}
+            type="button"
+            className={`ask-question-option ${selected === option.label && !other.trim() ? "selected" : ""}`}
+            onClick={() => { setSelected(option.label); setOther(""); }}
+            disabled={submitting}
+          >
+            <span>{option.label}</span>
+            {option.description ? <small>{option.description}</small> : null}
+          </button>
+        ))}
+      </div>
+      {question.allowOther ? <input
+        className="ask-question-other"
+        value={other}
+        onChange={event => { setOther(event.target.value); setSelected(""); }}
+        onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); submit(); } }}
+        placeholder="Other answer…"
+        aria-label="Other answer"
+        disabled={submitting}
+      /> : null}
+      <div className="ask-question-footer">
+        <span>{answer ? "Answer selected" : "Choose an option or type an answer"}</span>
+        <button className="ask-question-submit" type="button" onClick={submit} disabled={!answer || submitting}>
+          {submitting ? "Sending…" : "Submit"} <Check size={12} weight="bold" />
+        </button>
+      </div>
+    </section>
+  );
+}
+
+export function AppliedEditList({ edits, onRevert, latestEditId, revertingId }: { edits: AppliedEdit[]; onRevert?: (edit: AppliedEdit) => void; latestEditId?: string | null; revertingId?: string | null }): JSX.Element {
   const [expanded, setExpanded] = useState(true);
   if (!edits.length) return <></>;
   const first = edits[0]!;
@@ -99,6 +214,13 @@ export function AppliedEditList({ edits }: { edits: AppliedEdit[] }): JSX.Elemen
             <div className="edit-history-card-heading"><span><FileText size={14} /><strong>{editPreview(edit.description, 96)}</strong></span><Check size={14} weight="bold" /></div>
             {edit.before ? <div className="edit-diff-row"><small>Before</small><div className="edit-before">{editPreview(edit.before)}</div></div> : null}
             {edit.after ? <div className="edit-diff-row"><small>After</small><div className="edit-after">{editPreview(edit.after)}</div></div> : <div className="edit-applied">Applied directly in Word</div>}
+            {onRevert && edit.change ? <div className="edit-history-actions">
+              <button className="edit-revert-button" type="button" onClick={() => onRevert(edit)} disabled={latestEditId !== edit.id || revertingId === edit.id} title={latestEditId === edit.id ? "Restore the document before this edit" : "Only the latest edit can be reverted safely"}>
+                <ArrowCounterClockwise size={12} />
+                <span>{revertingId === edit.id ? "Reverting…" : "Revert"}</span>
+              </button>
+              {latestEditId !== edit.id ? <small className="edit-revert-note">Latest edit only</small> : null}
+            </div> : null}
           </article>
         ))}
       </div> : null}
@@ -207,6 +329,59 @@ export function ModePicker({ mode, onChange, disabled }: { mode: AgentMode; onCh
   );
 }
 
+export function ProviderPicker({ providers, selectedProviderId, disabled, onChange }: { providers: ProviderSummary[]; selectedProviderId: string; disabled?: boolean; onChange: (providerId: string) => void }): JSX.Element {
+  const menu = useDismissibleMenu();
+  const selected = providers.find(provider => provider.id === selectedProviderId);
+  const connected = providers.filter(provider => provider.auth.status === "connected");
+  const label = selected?.displayName ?? (connected.length ? "Choose provider" : "No connected provider");
+
+  return (
+    <div className="picker provider-picker" ref={menu.ref}>
+      <button
+        className="picker-trigger provider-trigger"
+        type="button"
+        onClick={() => menu.setOpen(current => !current)}
+        disabled={disabled || !providers.length}
+        aria-haspopup="listbox"
+        aria-expanded={menu.open}
+        aria-label={`Provider: ${label}`}
+      >
+        {selected ? <span className={`provider-status-dot ${selected.auth.status}`} aria-hidden="true" /> : null}
+        <span className="provider-trigger-name">{label}</span>
+        <CaretDown size={12} className="picker-caret" />
+      </button>
+      {menu.open ? (
+        <div className="picker-menu provider-menu" role="listbox" aria-label="Provider">
+          <div className="picker-header">Use provider</div>
+          <p className="provider-menu-hint">Connected accounts control the models shown in chat.</p>
+          {providers.map(provider => {
+            const isConnected = provider.auth.status === "connected";
+            const isSelected = provider.id === selectedProviderId;
+            return (
+              <button
+                key={provider.id}
+                type="button"
+                role="option"
+                aria-selected={isSelected}
+                className={`picker-option provider-option ${isSelected ? "selected" : ""}`}
+                disabled={!isConnected}
+                onClick={() => { onChange(provider.id); menu.setOpen(false); }}
+              >
+                <span className={`provider-status-dot ${provider.auth.status}`} aria-hidden="true" />
+                <span className="picker-option-copy">
+                  <strong>{provider.displayName}</strong>
+                  <small>{isConnected ? "Connected · models ready" : "Sign in required"}</small>
+                </span>
+                {isSelected ? <Check size={14} weight="bold" /> : null}
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export type ModelEffort = "low" | "medium" | "high";
 
 const EFFORTS: Array<{ value: ModelEffort; label: string }> = [
@@ -217,7 +392,7 @@ const EFFORTS: Array<{ value: ModelEffort; label: string }> = [
 
 const MODEL_DESCRIPTIONS = ["For toughest challenges", "For complex tasks", "Most efficient for everyday tasks", "Fastest for quick answers"];
 
-export function ModelPicker({ models, selectedModelId, label, loading, disabled, effort, onEffortChange, onChange }: { models: ModelInfo[]; selectedModelId: string; label: string; loading?: boolean; disabled?: boolean; effort: ModelEffort; onEffortChange: (effort: ModelEffort) => void; onChange: (modelId: string) => void }): JSX.Element {
+export function ModelPicker({ models, selectedModelId, label, providerName, loading, disabled, effort, onEffortChange, onChange }: { models: ModelInfo[]; selectedModelId: string; label: string; providerName?: string; loading?: boolean; disabled?: boolean; effort: ModelEffort; onEffortChange: (effort: ModelEffort) => void; onChange: (modelId: string) => void }): JSX.Element {
   const menu = useDismissibleMenu();
   const [showMoreModels, setShowMoreModels] = useState(true);
   const selected = models.find(model => model.id === selectedModelId);
@@ -250,7 +425,7 @@ export function ModelPicker({ models, selectedModelId, label, loading, disabled,
       {menu.open ? (
         <div className="picker-menu model-menu" role="listbox" aria-label="Model">
           <div className="model-options">
-            <div className="picker-header">Models</div>
+            <div className="picker-header">{providerName ? `${providerName} models` : "Models"}</div>
             {featuredModels.length ? featuredModels.map((model, index) => renderModel(model, index, true)) : <div className="picker-empty">No models found</div>}
             
             <div className="picker-divider" />
@@ -288,8 +463,217 @@ export function ModelPicker({ models, selectedModelId, label, loading, disabled,
 }
 
 export function AttachmentList({ attachments, onRemove, label = "Attached files" }: { attachments: AttachmentPreview[]; onRemove?: (id: string) => void; label?: string }): JSX.Element | null {
+  const [zoomed, setZoomed] = useState<AttachmentPreview | null>(null);
+
+  useEffect(() => {
+    if (!zoomed) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setZoomed(null);
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [zoomed]);
+
   if (!attachments.length) return null;
-  return <div className="attachment-list" aria-label={label}>{attachments.map(file => <div className="attachment-chip" key={file.id}><span className="attachment-icon">{file.mimeType === "application/pdf" ? <FileText size={13} /> : <ImageSquare size={13} />}</span><span className="attachment-copy"><strong>{file.name}</strong><small>{formatBytes(file.size)}</small></span>{onRemove ? <button type="button" className="attachment-remove" onClick={() => onRemove(file.id)} aria-label={`Remove ${file.name}`} title={`Remove ${file.name}`}><X size={12} /></button> : null}</div>)}</div>;
+  return <>
+    <div className="attachment-list" aria-label={label}>
+      {attachments.map(file => {
+        const imagePreview = file.mimeType.startsWith("image/") && Boolean(file.dataUrl);
+        return <article className={`attachment-chip ${imagePreview ? "attachment-chip-image" : ""}`} key={file.id}>
+          {imagePreview ? <button
+            type="button"
+            className="attachment-image-button"
+            onClick={() => setZoomed(file)}
+            aria-label={`Open ${file.name}`}
+            title="Open image"
+          >
+            <img src={file.dataUrl} alt={file.name} className="attachment-image" />
+            <span className="attachment-image-overlay">Click to zoom</span>
+          </button> : <span className="attachment-icon">{file.mimeType === "application/pdf" || file.mimeType === "text/plain" ? <FileText size={13} /> : <ImageSquare size={13} />}</span>}
+          <span className="attachment-copy"><strong>{file.name}</strong><small>{formatBytes(file.size)}</small></span>
+          {onRemove ? <button type="button" className="attachment-remove" onClick={() => onRemove(file.id)} aria-label={`Remove ${file.name}`} title={`Remove ${file.name}`}><X size={12} /></button> : null}
+        </article>;
+      })}
+    </div>
+    {zoomed?.dataUrl ? <div className="image-lightbox" role="dialog" aria-modal="true" aria-label={`Preview of ${zoomed.name}`} onClick={() => setZoomed(null)}>
+      <button type="button" className="image-lightbox-close" onClick={() => setZoomed(null)} aria-label="Close image preview" title="Close"><X size={18} /></button>
+      <figure className="image-lightbox-figure" onClick={event => event.stopPropagation()}>
+        <img src={zoomed.dataUrl} alt={zoomed.name} />
+        <figcaption>{zoomed.name}</figcaption>
+      </figure>
+    </div> : null}
+  </>;
+}
+
+function formatMath(value: string): string {
+  const symbols: Record<string, string> = {
+    alpha: "α", beta: "β", gamma: "γ", delta: "δ", theta: "θ", lambda: "λ", mu: "μ", pi: "π", sigma: "σ", phi: "φ", omega: "ω",
+    leq: "≤", geq: "≥", neq: "≠", times: "×", cdot: "·", pm: "±", to: "→", rightarrow: "→", leftarrow: "←", infty: "∞",
+  };
+  return value
+    .replace(/\\text\{([^{}]*)\}/g, "$1")
+    .replace(/\\(?:mathrm|mathbf|mathit)\{([^{}]*)\}/g, "$1")
+    .replace(/\\frac\{([^{}]*)\}\{([^{}]*)\}/g, "($1 / $2)")
+    .replace(/\\sqrt\{([^{}]*)\}/g, "√($1)")
+    .replace(/\^\{([^{}]*)\}/g, "^($1)")
+    .replace(/_\{([^{}]*)\}/g, "_($1)")
+    .replace(/\\([a-zA-Z]+)/g, (_match, command: string) => symbols[command] ?? command)
+    .replace(/[{}]/g, "")
+    .trim();
+}
+
+function renderInline(value: string, keyPrefix: string): ReactNode[] {
+  const tokenPattern = /(\`[^`\n]+\`|\\\([^\\\n]*\\\)|\$\$[^$\n]+\$\$|\$[^$\n]+\$|\*\*[^*\n]+\*\*|__[^_\n]+__|~~[^~\n]+~~|\[[^\]]+\]\(https?:\/\/[^)\s]+\)|\*[^*\n]+\*|_[^_\n]+_)/g;
+  const nodes: ReactNode[] = [];
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = tokenPattern.exec(value))) {
+    if (match.index > cursor) nodes.push(value.slice(cursor, match.index));
+    const token = match[0];
+    if (token.startsWith("`") && token.endsWith("`")) {
+      nodes.push(<code className="md-inline-code" key={`${keyPrefix}-code-${match.index}`}>{token.slice(1, -1)}</code>);
+    } else if (token.startsWith("\\(") && token.endsWith("\\)")) {
+      nodes.push(<span className="md-math-inline" key={`${keyPrefix}-math-${match.index}`}>{formatMath(token.slice(2, -2))}</span>);
+    } else if (token.startsWith("$$") && token.endsWith("$$")) {
+      nodes.push(<span className="md-math-inline" key={`${keyPrefix}-math-${match.index}`}>{formatMath(token.slice(2, -2))}</span>);
+    } else if (token.startsWith("$") && token.endsWith("$")) {
+      nodes.push(<span className="md-math-inline" key={`${keyPrefix}-math-${match.index}`}>{formatMath(token.slice(1, -1))}</span>);
+    } else if ((token.startsWith("**") && token.endsWith("**")) || (token.startsWith("__") && token.endsWith("__"))) {
+      nodes.push(<strong key={`${keyPrefix}-bold-${match.index}`}>{renderInline(token.slice(2, -2), `${keyPrefix}-bold-${match.index}`)}</strong>);
+    } else if (token.startsWith("~~") && token.endsWith("~~")) {
+      nodes.push(<del key={`${keyPrefix}-del-${match.index}`}>{renderInline(token.slice(2, -2), `${keyPrefix}-del-${match.index}`)}</del>);
+    } else if (token.startsWith("[") && token.includes("](")) {
+      const link = /^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/.exec(token);
+      if (link) nodes.push(<a href={link[2]} target="_blank" rel="noreferrer" key={`${keyPrefix}-link-${match.index}`}>{link[1]}</a>);
+      else nodes.push(token);
+    } else if (token.startsWith("*") || token.startsWith("_")) {
+      nodes.push(<em key={`${keyPrefix}-italic-${match.index}`}>{renderInline(token.slice(1, -1), `${keyPrefix}-italic-${match.index}`)}</em>);
+    } else {
+      nodes.push(token);
+    }
+    cursor = match.index + token.length;
+  }
+  if (cursor < value.length) nodes.push(value.slice(cursor));
+  return nodes;
+}
+
+function tableCells(line: string): string[] {
+  const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+  return trimmed.split("|").map(cell => cell.trim());
+}
+
+function isTableDivider(line: string): boolean {
+  const cells = tableCells(line);
+  return cells.length > 0 && cells.every(cell => /^:?-{3,}:?$/.test(cell));
+}
+
+function isBlockStart(line: string): boolean {
+  return /^\s*(?:#{1,6}\s|```|~~~|>|[-*+]\s+|\d+[.)]\s+|\$\$|\\\[|---+$)/.test(line);
+}
+
+export function MarkdownContent({ content }: { content: string }): JSX.Element {
+  const lines = content.replace(/\r\n?/g, "\n").split("\n");
+  const blocks: JSX.Element[] = [];
+  let index = 0;
+  let blockKey = 0;
+
+  while (index < lines.length) {
+    const line = lines[index] ?? "";
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const fence = /^\s*(```|~~~)(.*)$/.exec(line);
+    if (fence) {
+      const marker = fence[1]!;
+      const language = fence[2]!.trim();
+      const code: string[] = [];
+      index += 1;
+      while (index < lines.length && !new RegExp(`^\\s*${marker}`).test(lines[index] ?? "")) {
+        code.push(lines[index] ?? "");
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      blocks.push(<pre className="md-code-block" key={`md-${blockKey++}`}><code data-language={language || undefined}>{code.join("\n")}</code></pre>);
+      continue;
+    }
+
+    if (/^\s*\$\$\s*$/.test(line) || /^\s*\\\[\s*$/.test(line)) {
+      const closing = /^\s*\$\$\s*$/.test(line) ? /^\s*\$\$\s*$/ : /^\s*\\\]\s*$/;
+      const math: string[] = [];
+      index += 1;
+      while (index < lines.length && !closing.test(lines[index] ?? "")) {
+        math.push(lines[index] ?? "");
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      blocks.push(<div className="md-math-block" key={`md-${blockKey++}`}>{formatMath(math.join("\n"))}</div>);
+      continue;
+    }
+
+    const heading = /^(#{1,6})\s+(.+)$/.exec(line.trim());
+    if (heading) {
+      const Heading = `h${heading[1]!.length}` as keyof JSX.IntrinsicElements;
+      blocks.push(<Heading className="md-heading" key={`md-${blockKey++}`}>{renderInline(heading[2]!, `md-${blockKey}`)}</Heading>);
+      index += 1;
+      continue;
+    }
+
+    if (/^\s*(?:---+|___+|\*\*\*+)\s*$/.test(line)) {
+      blocks.push(<hr className="md-rule" key={`md-${blockKey++}`} />);
+      index += 1;
+      continue;
+    }
+
+    const nextLine = lines[index + 1] ?? "";
+    if (line.includes("|") && isTableDivider(nextLine)) {
+      const header = tableCells(line);
+      const rows: string[][] = [];
+      index += 2;
+      while (index < lines.length && lines[index]!.includes("|") && lines[index]!.trim()) {
+        rows.push(tableCells(lines[index]!));
+        index += 1;
+      }
+      blocks.push(<div className="md-table-wrap" key={`md-${blockKey++}`}><table className="md-table"><thead><tr>{header.map((cell, cellIndex) => <th key={cellIndex}>{renderInline(cell, `md-${blockKey}-h-${cellIndex}`)}</th>)}</tr></thead><tbody>{rows.map((row, rowIndex) => <tr key={rowIndex}>{header.map((_cell, cellIndex) => <td key={cellIndex}>{renderInline(row[cellIndex] ?? "", `md-${blockKey}-r-${rowIndex}-${cellIndex}`)}</td>)}</tr>)}</tbody></table></div>);
+      continue;
+    }
+
+    const listMatch = /^(\s*)([-*+]|\d+[.)])\s+(.+)$/.exec(line);
+    if (listMatch) {
+      const ordered = /^\d/.test(listMatch[2]!);
+      const items: string[] = [];
+      while (index < lines.length) {
+        const item = /^(\s*)([-*+]|\d+[.)])\s+(.+)$/.exec(lines[index] ?? "");
+        if (!item || (/^\d/.test(item[2]!) !== ordered)) break;
+        items.push(item[3]!);
+        index += 1;
+      }
+      const List = ordered ? "ol" : "ul";
+      blocks.push(<List className="md-list" key={`md-${blockKey++}`}>{items.map((item, itemIndex) => <li key={itemIndex}>{renderInline(item, `md-${blockKey}-${itemIndex}`)}</li>)}</List>);
+      continue;
+    }
+
+    if (/^\s*>/.test(line)) {
+      const quote: string[] = [];
+      while (index < lines.length && /^\s*>/.test(lines[index] ?? "")) {
+        quote.push((lines[index] ?? "").replace(/^\s*>\s?/, ""));
+        index += 1;
+      }
+      blocks.push(<blockquote className="md-quote" key={`md-${blockKey++}`}>{renderInline(quote.join("\n"), `md-${blockKey}`)}</blockquote>);
+      continue;
+    }
+
+    const paragraph: string[] = [line];
+    index += 1;
+    while (index < lines.length && (lines[index] ?? "").trim() && !isBlockStart(lines[index] ?? "")) {
+      paragraph.push(lines[index] ?? "");
+      index += 1;
+    }
+    blocks.push(<p className="md-paragraph" key={`md-${blockKey++}`}>{renderInline(paragraph.join("\n"), `md-${blockKey}`)}</p>);
+  }
+
+  return <div className="markdown-content">{blocks}</div>;
 }
 
 function formatBytes(bytes: number): string {

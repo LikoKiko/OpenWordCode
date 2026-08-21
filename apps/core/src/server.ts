@@ -7,8 +7,10 @@ import { dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import {
   OPENWORDCODE_VERSION,
+  MAX_INSTRUCTION_CHARS,
   type AgentEvent,
   type AgentAction,
+  type AgentQuestion,
   type AgentRequest,
   type ProviderConfig,
   type ProviderId,
@@ -87,9 +89,9 @@ const documentSchema = z.object({
 const attachmentSchema = z.object({
   id: z.string().min(1).max(120),
   name: z.string().min(1).max(260),
-  mimeType: z.enum(["application/pdf", "image/gif", "image/jpeg", "image/png", "image/webp"]),
+  mimeType: z.enum(["text/plain", "application/pdf", "image/gif", "image/jpeg", "image/png", "image/webp"]),
   size: z.number().int().min(1).max(6_000_000),
-  dataUrl: z.string().max(8_500_000).regex(/^data:(?:application\/pdf|image\/(?:gif|jpeg|png|webp));base64,[A-Za-z0-9+/]+=*$/),
+  dataUrl: z.string().max(8_500_000).regex(/^data:(?:text\/plain|application\/pdf|image\/(?:gif|jpeg|png|webp));base64,[A-Za-z0-9+/]+=*$/),
 });
 const attachmentsSchema = z.array(attachmentSchema).max(4).superRefine((files, context) => {
   if (files.reduce((total, file) => total + file.size, 0) > 12_000_000) context.addIssue({ code: z.ZodIssueCode.custom, message: "attachments exceed the 12 MB total limit" });
@@ -110,12 +112,13 @@ const skillsSchema = z.array(skillSchema).max(12);
 const agentSchema = z.object({
   providerId: bodyProviderId,
   modelId: z.string().trim().min(1).max(200),
+  contextWindow: z.number().int().min(8_000).max(5_000_000).optional(),
   effort: z.enum(["low", "medium", "high"]).optional(),
-  instruction: z.string().trim().min(1).max(8_000),
+  instruction: z.string().trim().min(1).max(MAX_INSTRUCTION_CHARS),
   mode: z.enum(["manual", "auto", "skip"]),
   document: documentSchema,
   attachments: attachmentsSchema.optional(),
-  conversation: z.array(z.object({ role: z.enum(["system", "user", "assistant", "tool"]), content: z.string().max(20_000), toolCallId: z.string().max(200).optional() })).max(12).optional(),
+  conversation: z.array(z.object({ role: z.enum(["system", "user", "assistant", "tool"]), content: z.string().max(20_000), toolCallId: z.string().max(200).optional() })).max(100).optional(),
   skills: skillsSchema.optional(),
   tools: z.object({ webSearch: z.boolean().optional(), console: z.boolean().optional() }).strict().optional(),
 });
@@ -226,6 +229,20 @@ function oauthCallbackPage(detail: string, success: boolean): string {
 export async function buildServer(state = createCoreState()): Promise<FastifyInstance> {
   const app = Fastify({ logger: false, bodyLimit: 32_000_000 });
   app.decorate("owcState", state);
+
+  type PendingQuestion = {
+    questionId: string;
+    resolve: (answer: string) => void;
+    timer: ReturnType<typeof setTimeout>;
+  };
+  const pendingQuestions = new Map<string, PendingQuestion>();
+  const clearPendingQuestion = (runId: string, fallbackAnswer?: string): void => {
+    const pending = pendingQuestions.get(runId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    pendingQuestions.delete(runId);
+    if (fallbackAnswer !== undefined) pending.resolve(fallbackAnswer);
+  };
 
   app.addHook("onRequest", async (request, reply) => {
     const origin = header(request, "origin");
@@ -496,17 +513,45 @@ export async function buildServer(state = createCoreState()): Promise<FastifyIns
     return { action: state.actions.transition(approved.id, result.ok ? "completed" : "failed", { output: result.output, ...(result.failureReason ? { failureReason: result.failureReason } : {}) }) };
   });
 
+  app.post<{ Params: { runId: string } }>("/api/agent/:runId/question", async request => {
+    const body = requireBody(z.object({
+      questionId: z.string().trim().min(1).max(120),
+      answer: z.string().trim().min(1).max(2_000),
+    }), request.body);
+    const runId = request.params.runId.trim();
+    const pending = pendingQuestions.get(runId);
+    if (!pending) throw new ApiError(404, "question_not_pending", "This clarification is no longer waiting for an answer.");
+    if (pending.questionId !== body.questionId) throw new ApiError(409, "question_mismatch", "That clarification is no longer active.");
+    clearPendingQuestion(runId, body.answer);
+    return { accepted: true };
+  });
+
   app.post("/api/agent", async (request, reply) => {
     const body = requireBody(agentSchema, request.body) as AgentRequest;
     const document = buildReadOnlyContext(body.document);
     const provider = runtimeFor(state, body.providerId as ProviderId);
     const controller = new AbortController();
+    const runId = randomUUID();
     request.raw.on("close", () => controller.abort());
     writeSseHeaders(reply);
     sendSse(reply, { type: "status", message: `Using ${provider.config.displayName} · ${body.modelId}` });
+    const abortPendingQuestion = (): void => clearPendingQuestion(runId, "The task was cancelled before the clarification was answered.");
+    controller.signal.addEventListener("abort", abortPendingQuestion, { once: true });
+    const askUser = (question: AgentQuestion): Promise<string> => {
+      clearPendingQuestion(runId, "A newer clarification replaced this question. Continue with the newest question.");
+      return new Promise(resolve => {
+        const timer = setTimeout(() => {
+          pendingQuestions.delete(runId);
+          resolve("No answer was provided before the clarification timed out. Continue with the safest reasonable interpretation.");
+        }, 10 * 60 * 1_000);
+        pendingQuestions.set(runId, { questionId: question.id, resolve, timer });
+        sendSse(reply, { type: "question", runId, question });
+      });
+    };
     const onEvent: AgentRuntimeOptions["onEvent"] = event => {
       if (event.type === "text") sendSse(reply, { type: "token", delta: event.delta });
       if (event.type === "tool") sendSse(reply, { type: "tool", name: event.name, state: event.state, ...(event.detail ? { detail: event.detail } : {}) });
+      if (event.type === "context") sendSse(reply, event);
       if (event.type === "action") {
         state.actions.add(event.action);
         sendSse(reply, { type: "action", action: event.action });
@@ -517,6 +562,7 @@ export async function buildServer(state = createCoreState()): Promise<FastifyIns
       const result = await runAgent({
         provider,
         modelId: body.modelId,
+        contextWindow: body.contextWindow,
         effort: body.effort,
         instruction: body.instruction,
         mode: body.mode,
@@ -526,6 +572,7 @@ export async function buildServer(state = createCoreState()): Promise<FastifyIns
         skills: body.skills,
         webSearchEnabled: body.tools?.webSearch === true,
         consoleEnabled: body.tools?.console === true,
+        askUser,
         searchWeb: body.tools?.webSearch === true && bridgeProvider
           ? query => searchWithOpenWordCodeBridge({ baseUrl: bridgeProvider.baseUrl, model: "gpt-5.6-luna", query, signal: controller.signal })
           : undefined,
@@ -562,6 +609,8 @@ export async function buildServer(state = createCoreState()): Promise<FastifyIns
       const message = controller.signal.aborted ? "Generation cancelled" : safeErrorMessage(error);
       sendSse(reply, { type: "error", code: controller.signal.aborted ? "cancelled" : "agent_failed", message });
     } finally {
+      controller.signal.removeEventListener("abort", abortPendingQuestion);
+      clearPendingQuestion(runId);
       if (!reply.raw.writableEnded) reply.raw.end();
     }
   });

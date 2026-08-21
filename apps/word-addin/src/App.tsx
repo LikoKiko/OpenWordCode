@@ -1,24 +1,28 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type JSX } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type ClipboardEvent as ReactClipboardEvent, type DragEvent as ReactDragEvent, type JSX } from "react";
 import {
   ArrowClockwise,
   ArrowLeft,
   ArrowUp,
   CaretRight,
+  CheckCircle,
   ClockCounterClockwise,
+  CircleNotch,
   GearSix,
   Globe,
   Paperclip,
   Plus,
   Sparkle,
   TerminalWindow,
+  UploadSimple,
   X,
 } from "@phosphor-icons/react";
-import type { AgentAction, AgentEvent, AgentMode, ChatAttachment, DocumentSnapshot, ModelInfo, ProposedChange, ProviderSummary, SkillSummary } from "../../../packages/shared/src/index.js";
-import { comparableText, visualElementTargetText } from "../../../packages/shared/src/index.js";
+import type { AgentAction, AgentEvent, AgentMode, AgentQuestion, ChatAttachment, ChatMessage, DocumentSnapshot, ModelInfo, ProposedChange, ProviderSummary, SkillSummary } from "../../../packages/shared/src/index.js";
+import { DEFAULT_CONTEXT_WINDOW, comparableText, estimateAttachmentTokens, estimateMessageTokens, estimateTokenCount, visualElementTargetText } from "../../../packages/shared/src/index.js";
 import { createWordAdapter, isOfficeHost, waitForOfficeReady, type WordApplicationAdapter } from "../../../packages/app-word/src/index.js";
-import { AppliedEditList, AttachmentList, ConsoleActionCard, DEFAULT_SKILLS, ModePicker, ModelPicker, parseSkillFile, RecentTasksDrawer, SearchList, SkillsDrawer, ThinkingTrace, type AppliedEdit, type AttachmentPreview, type ModelEffort, type RecentTask, type SearchItem } from "./components";
+import { AppliedEditList, AskUserQuestionCard, AttachmentList, ConsoleActionCard, ContextMeter, CopyAnswerButton, DEFAULT_SKILLS, MarkdownContent, ModePicker, ModelPicker, parseSkillFile, ProviderPicker, RecentTasksDrawer, SearchList, SkillsDrawer, ThinkingTrace, type AppliedEdit, type AttachmentPreview, type ModelEffort, type RecentTask, type SearchItem } from "./components";
 import {
   approveChange,
+  answerAgentQuestion,
   approveConsoleAction,
   completeChange,
   disconnectChatGPT,
@@ -31,6 +35,7 @@ import {
   getSettings,
   initializeCore,
   rejectConsoleAction,
+  rejectChange,
   saveSettings,
   startOAuthLogin,
   startChatGPTLogin,
@@ -49,6 +54,8 @@ import { dismissNotifications, notifyError, notifySuccess } from "./notification
 type Tab = "chat" | "settings";
 type UiMessage = { id: string; role: "user" | "assistant"; content: string; toolActivity?: string; attachments?: AttachmentPreview[]; actions?: AgentAction[]; edits?: AppliedEdit[] };
 type TaskSession = { id: string; title: string; createdAt: string; updatedAt: string; messages: UiMessage[] };
+type ContextUsage = { usedTokens: number; contextWindow: number; estimated?: boolean; phase?: "compacting" | "ready"; compacted?: boolean; summarizedMessages?: number; messageCount: number };
+type ContextCompactionState = { phase: "compacting" | "done"; summarizedMessages?: number };
 
 const MAX_ATTACHMENTS = 4;
 const MAX_ATTACHMENT_BYTES = 6_000_000;
@@ -56,7 +63,35 @@ const MAX_TOTAL_ATTACHMENT_BYTES = 12_000_000;
 const TASK_HISTORY_STORAGE_KEY = "openwordcode.task-history.v1";
 const SKILLS_STORAGE_KEY = "openwordcode.skills.v1";
 const MAX_TASK_HISTORY = 20;
+const INLINE_INSTRUCTION_MAX_CHARS = 8_000;
 const SUPPORTED_IMAGE_TYPES = new Set(["image/gif", "image/jpeg", "image/png", "image/webp"]);
+const SUPPORTED_TEXT_TYPES = new Set(["text/plain"]);
+
+function isStaleEditFailure(value: unknown): boolean {
+  const message = value instanceof Error ? value.message : typeof value === "string" ? value : "";
+  return /stale_change|content changed before|document changed before|selection changed before|target paragraph changed before|target paragraph changed after/iu.test(message);
+}
+
+function reserveAuthWindow(): Window | null {
+  // Reserve the popup during the button's synchronous click event. Opening it
+  // after awaiting Core is treated as an unsolicited popup by Office's browser.
+  const browser = window.open("about:blank", "_blank");
+  if (browser) {
+    try { browser.opener = null; } catch { /* best effort */ }
+  }
+  return browser;
+}
+
+function navigateAuthWindow(browser: Window | null, url: string): boolean {
+  if (!browser || browser.closed) return false;
+  browser.location.replace(url);
+  return true;
+}
+
+function closeAuthWindow(browser: Window | null): void {
+  try { browser?.close(); } catch { /* best effort */ }
+}
+
 function loadStoredSkills(): SkillSummary[] {
   if (typeof window === "undefined") return DEFAULT_SKILLS;
   try {
@@ -85,9 +120,15 @@ function saveStoredSkills(skills: SkillSummary[]): void {
 }
 
 function fileMimeType(file: File): ChatAttachment["mimeType"] | null {
-  if (file.type === "application/pdf" || SUPPORTED_IMAGE_TYPES.has(file.type)) return file.type as ChatAttachment["mimeType"];
-  if (file.name.toLocaleLowerCase().endsWith(".pdf")) return "application/pdf";
+  if (file.type === "application/pdf" || SUPPORTED_IMAGE_TYPES.has(file.type) || SUPPORTED_TEXT_TYPES.has(file.type)) return file.type as ChatAttachment["mimeType"];
+  const lowerName = file.name.toLocaleLowerCase();
+  if (lowerName.endsWith(".pdf")) return "application/pdf";
+  if (lowerName.endsWith(".txt")) return "text/plain";
   return null;
+}
+
+function requestsWebSearch(instruction: string): boolean {
+  return /(search(?:ed|ing)?\s+(?:online|the web|the internet)|search\s+for\s+.*\bonline|browse(?: the)?\s+web|look\s+(?:it|this|that)?\s*up\s+online|online\s+(?:research|search)|on the web|https?:\/\/|www\.)/iu.test(instruction);
 }
 
 function readDataUrl(file: File): Promise<string> {
@@ -97,6 +138,11 @@ function readDataUrl(file: File): Promise<string> {
     reader.onerror = () => reject(reader.error ?? new Error(`Could not read ${file.name}`));
     reader.readAsDataURL(file);
   });
+}
+
+async function instructionTextAttachment(value: string): Promise<ChatAttachment> {
+  const file = new File([value], `openwordcode-instruction-${Date.now()}.txt`, { type: "text/plain" });
+  return { id: uid(), name: file.name, mimeType: "text/plain", size: file.size, dataUrl: await readDataUrl(file) };
 }
 
 function uid(): string {
@@ -124,13 +170,13 @@ function storedMessages(messages: UiMessage[]): UiMessage[] {
       attachments: message.attachments.map(({ id, name, mimeType, size }) => ({ id, name, mimeType, size })),
     } : {}),
     ...(message.actions?.length ? { actions: message.actions } : {}),
-    ...(message.edits?.length ? { edits: message.edits } : {}),
+    ...(message.edits?.length ? { edits: message.edits.map(({ id, description, before, after }) => ({ id, description, ...(typeof before === "string" ? { before } : {}), ...(typeof after === "string" ? { after } : {}) })) } : {}),
   }));
 }
 
 function parseStoredAttachment(value: unknown): AttachmentPreview | null {
   if (!isRecord(value) || typeof value.id !== "string" || typeof value.name !== "string" || typeof value.size !== "number") return null;
-  if (value.mimeType !== "application/pdf" && value.mimeType !== "image/gif" && value.mimeType !== "image/jpeg" && value.mimeType !== "image/png" && value.mimeType !== "image/webp") return null;
+  if (value.mimeType !== "text/plain" && value.mimeType !== "application/pdf" && value.mimeType !== "image/gif" && value.mimeType !== "image/jpeg" && value.mimeType !== "image/png" && value.mimeType !== "image/webp") return null;
   return { id: value.id, name: value.name, mimeType: value.mimeType, size: value.size };
 }
 
@@ -242,7 +288,7 @@ function OAuthAccountCard({ provider, flow, busy, localCliLoginStarted, manualCo
 export default function App(): JSX.Element {
   const [adapter, setAdapter] = useState<WordApplicationAdapter>(() => createWordAdapter());
   const [wordReady, setWordReady] = useState(() => !isOfficeHost());
-  const [, setSnapshot] = useState<DocumentSnapshot | null>(null);
+  const [snapshot, setSnapshot] = useState<DocumentSnapshot | null>(null);
   const [coreOnline, setCoreOnline] = useState(false);
   const [coreVersion, setCoreVersion] = useState("—");
   const [providers, setProviders] = useState<ProviderSummary[]>([]);
@@ -283,9 +329,20 @@ export default function App(): JSX.Element {
   const [oauthLoginBusy, setOAuthLoginBusy] = useState(false);
   const [localCliLoginProviderId, setLocalCliLoginProviderId] = useState<string | null>(null);
   const [approvalNoticeDismissed, setApprovalNoticeDismissed] = useState(false);
+  const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null);
+  const [contextCompaction, setContextCompaction] = useState<ContextCompactionState | null>(null);
+  const [activeQuestion, setActiveQuestion] = useState<(AgentQuestion & { runId: string }) | null>(null);
+  const [questionSubmitting, setQuestionSubmitting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const dragDepthRef = useRef(0);
+  const [dragActive, setDragActive] = useState(false);
   const autoAppliedChanges = useRef(new Set<string>());
   const applyQueue = useRef(Promise.resolve());
+  const appliedChangeStack = useRef<ProposedChange[]>([]);
+  const [latestAppliedEditId, setLatestAppliedEditId] = useState<string | null>(null);
+  const [revertingEditId, setRevertingEditId] = useState<string | null>(null);
+  const contextCompactionTimer = useRef<number | null>(null);
+  const [staleRetry, setStaleRetry] = useState<{ instruction: string } | null>(null);
 
   const selectedProvider = useMemo(() => providers.find(provider => provider.id === selectedProviderId), [providers, selectedProviderId]);
   const visibleProviders = useMemo(() => providers.filter(provider => !provider.internal && provider.id !== "demo" && (provider.id === "openwordcode-bridge" || provider.auth.availableMethods.includes("oauth") || provider.auth.status === "connected")), [providers]);
@@ -293,6 +350,25 @@ export default function App(): JSX.Element {
   const activeSkills = useMemo(() => skills.filter(skill => skill.enabled !== false), [skills]);
   const selectedModel = useMemo(() => models.find(model => model.id === selectedModelId), [models, selectedModelId]);
   const modelLabel = selectedModel?.name || selectedModelId || (loadingModels ? "Loading model…" : "Choose model");
+  const selectedContextWindow = selectedModel?.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+  const contextWindowEstimated = selectedModel?.contextWindow === undefined;
+  const estimatedContextTokens = useMemo(() => {
+    const visibleMessages: ChatMessage[] = messages.map(message => ({ role: message.role, content: message.content }));
+    if (prompt.trim()) visibleMessages.push({ role: "user", content: prompt });
+    const documentContext = snapshot
+      ? [
+        snapshot.selection.text,
+        snapshot.documentText.slice(0, 12_000),
+        snapshot.paragraphs.slice(0, 40).map(item => item.text).join("\n"),
+        (snapshot.visualElements ?? []).map(visualElementTargetText).join("\n"),
+      ].join("\n")
+      : "";
+    const skillContext = activeSkills.map(skill => `${skill.name}\n${skill.description}\n${skill.instructions}`).join("\n\n").slice(0, 50_000);
+    const attachmentTokens = attachments.reduce((total, attachment) => total + estimateAttachmentTokens(attachment), 0);
+    return 2_500 + estimateMessageTokens(visibleMessages) + estimateTokenCount(documentContext) + estimateTokenCount(skillContext) + attachmentTokens;
+  }, [activeSkills, attachments, messages, prompt, snapshot]);
+  const currentContextUsage = contextUsage?.messageCount === messages.length ? contextUsage : null;
+  const displayContextUsage = currentContextUsage && !prompt.trim() && !attachments.length ? currentContextUsage : null;
 
   const refreshSnapshot = useCallback(async (): Promise<DocumentSnapshot> => {
     const next = await adapter.readSnapshot();
@@ -514,11 +590,11 @@ export default function App(): JSX.Element {
     }, 350);
     return () => window.clearTimeout(timer);
   }, [activeTaskId, messages]);
+  useEffect(() => () => {
+    if (contextCompactionTimer.current !== null) window.clearTimeout(contextCompactionTimer.current);
+  }, []);
 
-  const onFilesSelected = useCallback(async (event: ChangeEvent<HTMLInputElement>): Promise<void> => {
-    const input = event.currentTarget;
-    const selectedFiles = Array.from(input.files ?? []);
-    input.value = "";
+  const addFiles = useCallback(async (selectedFiles: File[]): Promise<void> => {
     if (!selectedFiles.length) return;
     if (attachments.length + selectedFiles.length > MAX_ATTACHMENTS) {
       setError(`You can attach up to ${MAX_ATTACHMENTS} files at a time.`);
@@ -527,7 +603,7 @@ export default function App(): JSX.Element {
     const supported = selectedFiles.flatMap(file => {
       const mimeType = fileMimeType(file);
       if (!mimeType) {
-        setError(`${file.name} is not supported. Use an image or PDF.`);
+        setError(`${file.name} is not supported. Use an image, PDF, or text file.`);
         return [];
       }
       if (file.size > MAX_ATTACHMENT_BYTES) {
@@ -553,18 +629,111 @@ export default function App(): JSX.Element {
     }
   }, [attachments]);
 
+  const onFilesSelected = useCallback(async (event: ChangeEvent<HTMLInputElement>): Promise<void> => {
+    const input = event.currentTarget;
+    const selectedFiles = Array.from(input.files ?? []);
+    input.value = "";
+    await addFiles(selectedFiles);
+  }, [addFiles]);
+
+  const onPaste = useCallback((event: ReactClipboardEvent<HTMLTextAreaElement>): void => {
+    const clipboardImages = Array.from(event.clipboardData.items)
+      .filter(item => item.kind === "file" && SUPPORTED_IMAGE_TYPES.has(item.type))
+      .map(item => item.getAsFile())
+      .filter((file): file is File => Boolean(file));
+    const pastedImages = clipboardImages.length
+      ? clipboardImages
+      : Array.from(event.clipboardData.files).filter(file => SUPPORTED_IMAGE_TYPES.has(file.type));
+    if (!pastedImages.length) return;
+
+    // Let the browser keep its normal text-paste behavior unless the
+    // clipboard actually contains an image file. Word, Snipping Tool, and
+    // browsers expose copied screenshots through clipboardData.items.
+    event.preventDefault();
+    void addFiles(pastedImages.map((file, index) => file.name ? file : new File([file], `pasted-image-${Date.now()}-${index + 1}.png`, { type: file.type || "image/png" })));
+  }, [addFiles]);
+
+  const onDragEnter = useCallback((event: ReactDragEvent<HTMLElement>): void => {
+    if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+    event.preventDefault();
+    dragDepthRef.current += 1;
+    setDragActive(true);
+  }, []);
+
+  const onDragOver = useCallback((event: ReactDragEvent<HTMLElement>): void => {
+    if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  }, []);
+
+  const onDragLeave = useCallback((event: ReactDragEvent<HTMLElement>): void => {
+    event.preventDefault();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDragActive(false);
+  }, []);
+
+  const onDrop = useCallback((event: ReactDragEvent<HTMLElement>): void => {
+    event.preventDefault();
+    dragDepthRef.current = 0;
+    setDragActive(false);
+    void addFiles(Array.from(event.dataTransfer.files));
+  }, [addFiles]);
+
   const removeAttachment = (id: string): void => setAttachments(previous => previous.filter(file => file.id !== id));
 
-  const sendInstruction = useCallback(async (instruction = prompt): Promise<void> => {
+  const submitQuestionAnswer = useCallback(async (answer: string): Promise<void> => {
+    if (!activeQuestion || questionSubmitting) return;
+    setQuestionSubmitting(true);
+    try {
+      await answerAgentQuestion(activeQuestion.runId, activeQuestion.id, answer);
+      setActiveQuestion(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not send that answer");
+    } finally {
+      setQuestionSubmitting(false);
+    }
+  }, [activeQuestion, questionSubmitting, setError]);
+
+  const sendInstruction = useCallback(async (instruction = prompt, automaticRetry = false): Promise<void> => {
     const currentAttachments = attachments;
     const trimmed = instruction.trim() || (currentAttachments.length ? "Review the attached files and summarize the relevant findings." : "");
     if ((!trimmed && !currentAttachments.length) || busy || !coreOnline || !selectedModelId || !wordReady) return;
+    let requestInstruction = trimmed;
+    let requestAttachments = currentAttachments;
+    if (trimmed.length > INLINE_INSTRUCTION_MAX_CHARS) {
+      if (currentAttachments.length >= MAX_ATTACHMENTS) {
+        setError(`This request is being converted to a text attachment, but the ${MAX_ATTACHMENTS}-file limit is already full. Remove one attachment and try again.`);
+        return;
+      }
+      try {
+        const generated = await instructionTextAttachment(trimmed);
+        if (generated.size > MAX_ATTACHMENT_BYTES) {
+          setError("This request is too large to upload as a text attachment. Keep it below 6 MB and try again.");
+          return;
+        }
+        if (currentAttachments.reduce((total, file) => total + file.size, 0) + generated.size > MAX_TOTAL_ATTACHMENT_BYTES) {
+          setError("This request and its attachments exceed the 12 MB total limit. Remove an attachment and try again.");
+          return;
+        }
+        requestAttachments = [...currentAttachments, generated];
+        requestInstruction = `Read the attached text file \"${generated.name}\" in full. Treat its contents as my complete request, then carry out the task.`;
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "Could not prepare the long request as a text attachment");
+        return;
+      }
+    }
     setPrompt("");
     setAttachments([]);
     setComposerToolsOpen(false);
+    setActiveQuestion(null);
+    setQuestionSubmitting(false);
     setError("");
+    if (contextCompactionTimer.current !== null) window.clearTimeout(contextCompactionTimer.current);
+    contextCompactionTimer.current = null;
+    setContextCompaction(null);
     const current = await refreshSnapshot();
-    const userMessage: UiMessage = { id: uid(), role: "user", content: trimmed, ...(currentAttachments.length ? { attachments: currentAttachments } : {}) };
+    const wantsWebSearch = webSearchEnabled || requestsWebSearch(trimmed);
+    const userMessage: UiMessage = { id: uid(), role: "user", content: requestInstruction, ...(requestAttachments.length ? { attachments: requestAttachments } : {}) };
     const assistantId = uid();
     setMessages(previous => [...previous, userMessage, { id: assistantId, role: "assistant", content: "" }]);
     const controller = new AbortController();
@@ -574,14 +743,15 @@ export default function App(): JSX.Element {
       await streamAgent({
         providerId: selectedProviderId,
         modelId: selectedModelId,
+        ...(selectedModel?.contextWindow ? { contextWindow: selectedModel.contextWindow } : {}),
         effort: modelEffort,
-        instruction: trimmed,
+        instruction: requestInstruction,
         mode,
         document: current,
-        ...(messages.length ? { conversation: messages.slice(-8).map(message => ({ role: message.role, content: message.content })) } : {}),
-        ...(currentAttachments.length ? { attachments: currentAttachments } : {}),
+        ...(messages.length ? { conversation: messages.map(message => ({ role: message.role, content: message.content })) } : {}),
+        ...(requestAttachments.length ? { attachments: requestAttachments } : {}),
         skills: activeSkills,
-        tools: { ...(webSearchEnabled ? { webSearch: true } : {}), ...(consoleEnabled ? { console: true } : {}) },
+        tools: { ...(wantsWebSearch ? { webSearch: true } : {}), ...(consoleEnabled ? { console: true } : {}) },
       }, (event: AgentEvent) => {
         if (event.type === "token") {
           setMessages(previous => previous.map(message => message.id === assistantId ? { ...message, content: message.content + event.delta } : message));
@@ -592,27 +762,85 @@ export default function App(): JSX.Element {
         if (event.type === "proposal") {
           if (!autoAppliedChanges.current.has(event.change.id)) {
             autoAppliedChanges.current.add(event.change.id);
-            applyQueue.current = applyQueue.current.catch(() => undefined).then(() => apply(event.change, assistantId));
+            applyQueue.current = applyQueue.current.catch(() => undefined).then(() => apply(event.change, assistantId, trimmed, !automaticRetry));
           }
         }
         if (event.type === "action") {
           setMessages(previous => previous.map(message => message.id === assistantId ? { ...message, actions: [...(message.actions ?? []).filter(action => action.id !== event.action.id), event.action] } : message));
         }
+        if (event.type === "context") {
+          setContextUsage({ ...event, messageCount: messages.length + 2 });
+          if (event.phase === "compacting") {
+            if (contextCompactionTimer.current !== null) window.clearTimeout(contextCompactionTimer.current);
+            contextCompactionTimer.current = null;
+            setContextCompaction({ phase: "compacting", summarizedMessages: event.summarizedMessages });
+          }
+          if (event.phase === "ready" && event.compacted) {
+            setContextCompaction({ phase: "done", summarizedMessages: event.summarizedMessages });
+            if (contextCompactionTimer.current !== null) window.clearTimeout(contextCompactionTimer.current);
+            contextCompactionTimer.current = window.setTimeout(() => {
+              contextCompactionTimer.current = null;
+              setContextCompaction(current => current?.phase === "done" ? null : current);
+            }, 1_800);
+          }
+        }
+        if (event.type === "question") {
+          setActiveQuestion({ ...event.question, runId: event.runId });
+          setQuestionSubmitting(false);
+        }
         if (event.type === "done") {
+          setActiveQuestion(null);
           setMessages(previous => previous.map(message => message.id === assistantId ? { ...message, content: event.answer, toolActivity: undefined } : message));
         }
-        if (event.type === "error") setError(event.message);
+        if (event.type === "error") {
+          setActiveQuestion(null);
+          setQuestionSubmitting(false);
+          setError(event.message);
+        }
       }, controller.signal);
     } catch (cause) {
       if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : "Generation failed");
     } finally {
+      if (controller.signal.aborted) {
+        setActiveQuestion(null);
+        setQuestionSubmitting(false);
+      }
       setBusy(false);
       setAbortController(null);
     }
-  }, [attachments, busy, consoleEnabled, coreOnline, messages, mode, prompt, refreshSnapshot, selectedModelId, selectedProviderId, webSearchEnabled, wordReady]);
+  }, [activeSkills, attachments, busy, consoleEnabled, coreOnline, messages, mode, modelEffort, prompt, refreshSnapshot, selectedModel, selectedModelId, selectedProviderId, webSearchEnabled, wordReady]);
 
-  async function apply(change: ProposedChange, assistantId: string): Promise<void> {
+  useEffect(() => {
+    if (busy || !staleRetry) return;
+    const retry = staleRetry;
+    const timer = window.setTimeout(() => {
+      setStaleRetry(null);
+      void sendInstruction(
+        `The document changed while the previous edit was being applied. Refresh the current Word document context and retry the user's original request now. Do not only explain the conflict; make the edit if it is still valid.\n\nOriginal request:\n${retry.instruction}`,
+        true,
+      );
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [busy, sendInstruction, staleRetry]);
+
+  async function apply(change: ProposedChange, assistantId: string, instruction: string, allowAutoRetry: boolean): Promise<void> {
     setError("");
+    const retryNotice = "The document changed while I was applying this edit. I’m refreshing the document context and retrying it now.";
+    const handleStaleFailure = (failure: string): void => {
+      if (!allowAutoRetry) {
+        setError(failure);
+        setMessages(previous => previous.map(message => message.id === assistantId
+          ? { ...message, content: `${message.content}\n\nI couldn’t apply this edit in Word: ${failure}`.trim() }
+          : message));
+        return;
+      }
+      setError("");
+      notifySuccess("The document changed, so I refreshed it and I’m retrying the edit.");
+      setMessages(previous => previous.map(message => message.id === assistantId && !message.content.includes(retryNotice)
+        ? { ...message, content: `${message.content}\n\n${retryNotice}`.trim() }
+        : message));
+      setStaleRetry(current => current ?? { instruction });
+    };
     try {
       const current = await refreshSnapshot();
       const currentParagraph = change.target.kind === "paragraph"
@@ -640,20 +868,58 @@ export default function App(): JSX.Element {
       await completeChange(change.id, result.success, result.message);
       if (!result.success) {
         const failure = result.message ?? "Word rejected the change";
-        setError(failure);
-        setMessages(previous => previous.map(message => message.id === assistantId
-          ? { ...message, content: `${message.content}\n\nI couldn’t apply this edit in Word: ${failure}`.trim() }
-          : message));
+        if (isStaleEditFailure(failure)) handleStaleFailure(failure);
+        else {
+          setError(failure);
+          setMessages(previous => previous.map(message => message.id === assistantId
+            ? { ...message, content: `${message.content}\n\nI couldn’t apply this edit in Word: ${failure}`.trim() }
+            : message));
+        }
       }
       else {
         await refreshSnapshot();
-        const edit: AppliedEdit = { id: change.id, description: change.description, before: change.before ?? currentBefore, ...(typeof change.after === "string" ? { after: change.after } : {}) };
+        appliedChangeStack.current = [...appliedChangeStack.current.filter(item => item.id !== approved.id), approved];
+        setLatestAppliedEditId(approved.id);
+        const edit: AppliedEdit = { id: approved.id, description: approved.description, before: approved.before ?? currentBefore, ...(typeof approved.after === "string" ? { after: approved.after } : {}), change: approved };
         setMessages(previous => previous.map(message => message.id === assistantId ? { ...message, edits: [...(message.edits ?? []).filter(item => item.id !== edit.id), edit] } : message));
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Could not apply change");
+      if (isStaleEditFailure(cause)) {
+        try { await rejectChange(change.id); } catch { /* the stale proposal may already be closed */ }
+        handleStaleFailure(cause instanceof Error ? cause.message : "The document changed before the edit could be applied.");
+      } else setError(cause instanceof Error ? cause.message : "Could not apply change");
     }
   }
+
+  const revertAppliedEdit = async (edit: AppliedEdit): Promise<void> => {
+    const change = edit.change;
+    const latest = appliedChangeStack.current[appliedChangeStack.current.length - 1];
+    if (!change || !latest || latest.id !== edit.id) {
+      setError("Only the latest edit can be reverted safely.");
+      return;
+    }
+    if (busy || revertingEditId) return;
+    setRevertingEditId(edit.id);
+    setError("");
+    try {
+      const result = await adapter.revertChange(change);
+      if (!result.success) {
+        setError(result.message ?? "Could not revert this edit");
+        return;
+      }
+      appliedChangeStack.current = appliedChangeStack.current.slice(0, -1);
+      setLatestAppliedEditId(appliedChangeStack.current[appliedChangeStack.current.length - 1]?.id ?? null);
+      setMessages(previous => previous.map(message => message.edits?.some(item => item.id === edit.id)
+        ? { ...message, edits: message.edits.filter(item => item.id !== edit.id) }
+        : message));
+      await refreshSnapshot();
+      notifySuccess("Edit reverted in Word.");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not revert this edit");
+    } finally {
+      setRevertingEditId(null);
+    }
+  };
 
   const updateActionInMessages = (action: AgentAction): void => {
     setMessages(previous => previous.map(message => message.actions?.some(item => item.id === action.id)
@@ -680,6 +946,13 @@ export default function App(): JSX.Element {
     }
   }
 
+  const resetContextIndicator = (): void => {
+    setContextUsage(null);
+    if (contextCompactionTimer.current !== null) window.clearTimeout(contextCompactionTimer.current);
+    contextCompactionTimer.current = null;
+    setContextCompaction(null);
+  };
+
   const chooseProvider = async (id: string): Promise<void> => {
     setSelectedProviderId(id);
     setSelectedModelId("");
@@ -690,12 +963,21 @@ export default function App(): JSX.Element {
   const loginChatGPT = async (): Promise<void> => {
     setChatGptLoginBusy(true);
     setError("");
+    const browser = reserveAuthWindow();
+    if (!browser) {
+      setChatGptLoginBusy(false);
+      setError("Your browser blocked the sign-in window. Allow pop-ups for the OpenWordCode Core address and try again.");
+      return;
+    }
     try {
       const flow = await startChatGPTLogin();
       setChatGptFlowId(flow.flowId);
-      const browser = window.open(flow.authorizeUrl, "_blank", "noopener,noreferrer");
-      if (!browser) setError("Your browser blocked the sign-in window. Allow pop-ups for the OpenWordCode Core address and try again.");
+      if (!navigateAuthWindow(browser, flow.authorizeUrl)) {
+        setChatGptLoginBusy(false);
+        setError("The sign-in window was closed before login could start. Try again.");
+      }
     } catch (cause) {
+      closeAuthWindow(browser);
       setChatGptLoginBusy(false);
       setError(cause instanceof Error ? cause.message : "Could not start ChatGPT sign-in");
     }
@@ -751,6 +1033,12 @@ export default function App(): JSX.Element {
     if (!selectedProvider || selectedProvider.kind === "openwordcode-bridge") return;
     setOAuthLoginBusy(true);
     setError("");
+    const browser = reserveAuthWindow();
+    if (!browser) {
+      setOAuthLoginBusy(false);
+      setError("Your browser blocked the sign-in window. Allow pop-ups for the OpenWordCode Core address and try again.");
+      return;
+    }
     try {
       const flow = await startOAuthLogin(selectedProvider.id);
       setOAuthLoginInfo(flow);
@@ -758,10 +1046,15 @@ export default function App(): JSX.Element {
       setOAuthManualCode("");
       const url = flow.authorizeUrl ?? flow.verificationUrl;
       if (url) {
-        const browser = window.open(url, "_blank", "noopener,noreferrer");
-        if (!browser) setError("Your browser blocked the sign-in window. Allow pop-ups for the OpenWordCode Core address and try again.");
+        if (!navigateAuthWindow(browser, url)) {
+          setOAuthLoginBusy(false);
+          setError("The sign-in window was closed before login could start. Try again.");
+        }
+      } else {
+        closeAuthWindow(browser);
       }
     } catch (cause) {
+      closeAuthWindow(browser);
       setOAuthLoginBusy(false);
       setOAuthLoginInfo(null);
       setOAuthManualCode("");
@@ -855,8 +1148,13 @@ export default function App(): JSX.Element {
     abortController?.abort();
     setActiveTaskId(uid());
     setMessages([]);
+    appliedChangeStack.current = [];
+    setLatestAppliedEditId(null);
     setPrompt("");
     setAttachments([]);
+    setActiveQuestion(null);
+    setQuestionSubmitting(false);
+    resetContextIndicator();
     setComposerToolsOpen(false);
     setRecentTasksOpen(false);
     setError("");
@@ -870,8 +1168,13 @@ export default function App(): JSX.Element {
     abortController?.abort();
     setActiveTaskId(task.id);
     setMessages(task.messages);
+    appliedChangeStack.current = [];
+    setLatestAppliedEditId(null);
     setPrompt("");
     setAttachments([]);
+    setActiveQuestion(null);
+    setQuestionSubmitting(false);
+    resetContextIndicator();
     setComposerToolsOpen(false);
     setRecentTasksOpen(false);
     setError("");
@@ -884,8 +1187,13 @@ export default function App(): JSX.Element {
     abortController?.abort();
     setActiveTaskId(uid());
     setMessages([]);
+    appliedChangeStack.current = [];
+    setLatestAppliedEditId(null);
     setPrompt("");
     setAttachments([]);
+    setActiveQuestion(null);
+    setQuestionSubmitting(false);
+    resetContextIndicator();
     setComposerToolsOpen(false);
     setRecentTasksOpen(false);
     setError("");
@@ -897,8 +1205,13 @@ export default function App(): JSX.Element {
     setTaskSessions([]);
     setActiveTaskId(uid());
     setMessages([]);
+    appliedChangeStack.current = [];
+    setLatestAppliedEditId(null);
     setPrompt("");
     setAttachments([]);
+    setActiveQuestion(null);
+    setQuestionSubmitting(false);
+    resetContextIndicator();
     setComposerToolsOpen(false);
     setRecentTasksOpen(false);
     setError("");
@@ -1001,13 +1314,14 @@ export default function App(): JSX.Element {
       {skillsDrawerOpen ? <SkillsDrawer skills={skills} onToggleSkill={toggleSkill} onUploadSkill={uploadSkillFile} onCreateSkill={createSkill} onDeleteSkill={deleteSkill} onClose={() => setSkillsDrawerOpen(false)} /> : null}
 
       {tab === "chat" ? (
-        <section className="chat-panel">
+        <section className={`chat-panel ${dragActive ? "drag-active" : ""}`} onDragEnter={onDragEnter} onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}>
+          {dragActive ? <div className="drop-overlay" role="status"><UploadSimple size={22} /><strong>Drop files here</strong><span>Images, PDFs, and text files will be added to this message</span></div> : null}
           <div className="chat-scroll">
             {messages.length === 0 ? <div className="empty-chat" aria-hidden="true" /> : (
               <div className="messages">
                 {messages.map(message => (
                   <article className={`message ${message.role}`} key={message.id}>
-                    {message.role === "user" ? <div className="user-message" dir="auto"><span>{message.content}</span>{message.attachments ? <AttachmentList attachments={message.attachments} label="Sent attachments" /> : null}</div> : <div className="assistant-message"><div className="assistant-label"><Sparkle size={13} weight="fill" /> OpenWordCode</div><div className="assistant-content" dir="auto">{busy && message.id === messages[messages.length - 1]?.id ? <ThinkingTrace active activity={message.toolActivity} /> : null}{message.content || null}{message.edits ? <AppliedEditList edits={message.edits} /> : null}{message.actions?.map(action => <ConsoleActionCard key={action.id} action={action} acting={actingAction === action.id} onApprove={runConsoleAction} onReject={blockConsoleAction} />)}</div></div>}
+                    {message.role === "user" ? <div className="user-message" dir="auto"><span>{message.content}</span>{message.attachments ? <AttachmentList attachments={message.attachments} label="Sent attachments" /> : null}</div> : <div className="assistant-message"><div className="assistant-label"><Sparkle size={13} weight="fill" /> OpenWordCode</div><div className="assistant-content" dir="auto">{busy && message.id === messages[messages.length - 1]?.id ? <ThinkingTrace active activity={message.toolActivity} /> : null}{message.content ? <MarkdownContent content={message.content} /> : null}{message.content ? <div className="assistant-answer-actions"><CopyAnswerButton content={message.content} disabled={busy && message.id === messages[messages.length - 1]?.id} /></div> : null}{message.edits ? <AppliedEditList edits={message.edits} onRevert={edit => void revertAppliedEdit(edit)} latestEditId={latestAppliedEditId} revertingId={revertingEditId} /> : null}{message.actions?.map(action => <ConsoleActionCard key={action.id} action={action} acting={actingAction === action.id} onApprove={runConsoleAction} onReject={blockConsoleAction} />)}</div></div>}
                   </article>
                 ))}
               </div>
@@ -1017,18 +1331,38 @@ export default function App(): JSX.Element {
 
           {mode === "skip" && !approvalNoticeDismissed ? <div className="approval-notice"><div><strong>Skip all approvals is on.</strong><p>OpenWordCode will not pause, even for unsafe document actions. You can change this from the approval control below.</p></div><button type="button" onClick={() => setApprovalNoticeDismissed(true)} aria-label="Dismiss approval notice" title="Dismiss"><X size={18} /></button></div> : null}
 
+          <div className="context-bar">
+            {contextCompaction ? <div className={`context-compaction ${contextCompaction.phase}`} role="status" aria-live="polite">
+              {contextCompaction.phase === "compacting" ? <CircleNotch className="spin" size={13} /> : <CheckCircle size={13} weight="fill" />}
+              <span>{contextCompaction.phase === "compacting" ? "Compacting conversation…" : "Conversation compacted · continuing"}</span>
+            </div> : <span />}
+            <ContextMeter
+              usedTokens={displayContextUsage?.usedTokens ?? estimatedContextTokens}
+              contextWindow={displayContextUsage?.contextWindow ?? selectedContextWindow}
+              estimated={displayContextUsage?.estimated ?? contextWindowEstimated}
+              compacted={displayContextUsage?.compacted === true}
+              summarizedMessages={displayContextUsage?.summarizedMessages ?? 0}
+            />
+          </div>
+
+          {activeQuestion ? <AskUserQuestionCard
+            question={activeQuestion}
+            submitting={questionSubmitting}
+            onSubmit={answer => void submitQuestionAnswer(answer)}
+          /> : null}
+
           <div className="composer-wrap">
             {attachments.length ? <AttachmentList attachments={attachments} onRemove={removeAttachment} /> : null}
-            <textarea dir="auto" value={prompt} onChange={event => setPrompt(event.target.value)} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendInstruction(); } }} placeholder="Ask OpenWordCode…" disabled={!coreOnline || busy || !wordReady} rows={2} />
+            <textarea dir="auto" value={prompt} onChange={event => setPrompt(event.target.value)} onPaste={onPaste} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendInstruction(); } }} placeholder="Ask OpenWordCode…" disabled={!coreOnline || busy || !wordReady} rows={2} />
             <div className="composer-footer">
               <div className="composer-tools">
                 <button className={`composer-add ${composerToolsOpen ? "active" : ""}`} onClick={() => setComposerToolsOpen(current => !current)} aria-label="Open chat tools" aria-expanded={composerToolsOpen} title="Chat tools"><Plus size={15} weight="bold" /></button>
                 {composerToolsOpen ? <SearchList items={composerTools} onClose={() => setComposerToolsOpen(false)} /> : null}
               </div>
-              <input ref={fileInputRef} className="file-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,.pdf" multiple onChange={event => void onFilesSelected(event)} />
+              <input ref={fileInputRef} className="file-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,.pdf,text/plain,.txt" multiple onChange={event => void onFilesSelected(event)} />
               <ModePicker mode={mode} onChange={changeApprovalMode} disabled={!coreOnline || busy || !wordReady} />
-              <ModelPicker models={models} selectedModelId={selectedModelId} label={modelLabel} loading={loadingModels} effort={modelEffort} onEffortChange={setModelEffort} onChange={modelId => { setSelectedModelId(modelId); void saveSettings({ selectedModelId: modelId }); }} disabled={!coreOnline || loadingModels || busy || !wordReady} />
-              {busy ? <button className="send-button stop" onClick={() => abortController?.abort()} aria-label="Stop response" title="Stop response"><X size={14} weight="bold" /></button> : <button className="send-button" onClick={() => void sendInstruction()} disabled={(!prompt.trim() && !attachments.length) || !selectedModelId || !coreOnline || uploadingFiles || !wordReady} aria-label="Send message" title="Send message"><ArrowUp size={14} weight="bold" /></button>}
+              <ModelPicker models={models} selectedModelId={selectedModelId} label={modelLabel} providerName={selectedProvider?.displayName} loading={loadingModels} effort={modelEffort} onEffortChange={setModelEffort} onChange={modelId => { setSelectedModelId(modelId); void saveSettings({ selectedModelId: modelId }); }} disabled={!coreOnline || loadingModels || busy || !wordReady} />
+              {busy ? <button className="send-button stop" onClick={() => { abortController?.abort(); setActiveQuestion(null); setQuestionSubmitting(false); }} aria-label="Stop response" title="Stop response"><X size={14} weight="bold" /></button> : <button className="send-button" onClick={() => void sendInstruction()} disabled={(!prompt.trim() && !attachments.length) || !selectedModelId || !coreOnline || uploadingFiles || !wordReady} aria-label="Send message" title="Send message"><ArrowUp size={14} weight="bold" /></button>}
             </div>
           </div>
           <p className="composer-disclaimer">OpenWordCode can make mistakes. Check important information.</p>
@@ -1045,6 +1379,13 @@ export default function App(): JSX.Element {
 
           <div className="settings-group">
             <div className="settings-label"><span>Accounts</span><small>{connectedProviderCount} connected</small></div>
+            <div className="provider-switcher">
+              <div className="provider-switcher-heading">
+                <span>Use provider</span>
+                <small>Models in chat update automatically</small>
+              </div>
+              <ProviderPicker providers={visibleProviders} selectedProviderId={selectedProviderId} onChange={id => void chooseProvider(id)} disabled={!coreOnline || loadingModels || busy || !wordReady} />
+            </div>
             <div className="settings-list">
               {visibleProviders.map(provider => {
                 const active = provider.id === selectedProviderId;

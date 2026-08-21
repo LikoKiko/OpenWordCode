@@ -148,13 +148,13 @@ async function routeForModel(state: CoreState, modelId: string): Promise<BridgeR
 function mimeFromDataUrl(value: string): string | null {
   const match = /^data:([^;,]+);base64,/u.exec(value);
   const mime = match?.[1]?.toLowerCase();
-  return mime && ["application/pdf", "image/gif", "image/jpeg", "image/png", "image/webp"].includes(mime) ? mime : null;
+  return mime && ["text/plain", "application/pdf", "image/gif", "image/jpeg", "image/png", "image/webp"].includes(mime) ? mime : null;
 }
 
 function attachmentFromDataUrl(value: string, name: string, id: string, mimeHint?: string): ChatAttachment {
   const mimeType = mimeFromDataUrl(value) ?? mimeHint;
-  if (!mimeType || !["application/pdf", "image/gif", "image/jpeg", "image/png", "image/webp"].includes(mimeType)) {
-    throw new BridgeRequestError(400, "OpenWordCode Bridge accepts only image and PDF data URLs");
+  if (!mimeType || !["text/plain", "application/pdf", "image/gif", "image/jpeg", "image/png", "image/webp"].includes(mimeType)) {
+    throw new BridgeRequestError(400, "OpenWordCode Bridge accepts only text, image, and PDF data URLs");
   }
   const comma = value.indexOf(",");
   const encoded = comma >= 0 ? value.slice(comma + 1) : "";
@@ -193,7 +193,7 @@ function contentTextAndAttachments(content: unknown, messageIndex: number): { te
       if (!data) continue;
       const filename = stringValue(file.filename) ?? stringValue(file.name) ?? `file-${messageIndex + 1}-${partIndex + 1}`;
       const mimeHint = stringValue(file.mime_type) ?? stringValue(part.mime_type)
-        ?? (type === "document" || /\.pdf$/iu.test(filename) ? "application/pdf" : undefined);
+        ?? (type === "document" || /\.pdf$/iu.test(filename) ? "application/pdf" : /\.txt$/iu.test(filename) ? "text/plain" : undefined);
       const dataUrl = data.startsWith("data:") ? data : `${mimeHint ? `data:${mimeHint}` : "data:application/pdf"};base64,${data}`;
       attachments.push(attachmentFromDataUrl(dataUrl, filename, `bridge-file-${messageIndex}-${partIndex}`, mimeHint));
     }

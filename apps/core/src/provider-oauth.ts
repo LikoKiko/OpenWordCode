@@ -107,11 +107,21 @@ const NOUS_INFERENCE_BASE_URL = "https://inference-api.nousresearch.com/v1";
 const OAUTH_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_DEVICE_POLL_INTERVAL_MS = 30_000;
 
-const LOOPBACK: Record<"anthropic" | "xai" | "google-antigravity", { port: number; authorizePath: string }> = {
-  anthropic: { port: 54545, authorizePath: "/callback" },
-  xai: { port: 56121, authorizePath: "/callback" },
-  "google-antigravity": { port: 51121, authorizePath: "/callback" },
+type BrowserOAuthProviderId = "anthropic" | "xai" | "google-antigravity";
+
+const LOOPBACK: Record<BrowserOAuthProviderId, { port: number; authorizePath: string; hostname: "localhost" | "127.0.0.1" }> = {
+  // Anthropic's public Claude Code OAuth client has localhost registered. The
+  // hostname is part of the OAuth redirect URI and cannot be substituted with
+  // another spelling of loopback (Anthropic rejects 127.0.0.1 here).
+  anthropic: { port: 54545, authorizePath: "/callback", hostname: "localhost" },
+  xai: { port: 56121, authorizePath: "/callback", hostname: "127.0.0.1" },
+  "google-antigravity": { port: 51121, authorizePath: "/callback", hostname: "127.0.0.1" },
 };
+
+export function oauthRedirectUri(providerId: BrowserOAuthProviderId): string {
+  const callback = LOOPBACK[providerId];
+  return `http://${callback.hostname}:${callback.port}${callback.authorizePath}`;
+}
 
 interface StoredOAuthCredential {
   accessToken: string;
@@ -166,6 +176,7 @@ interface OAuthFlow {
   verifier?: string;
   redirectUri?: string;
   server?: Server;
+  servers?: Server[];
   device?: DeviceFlowData;
 }
 
@@ -613,15 +624,16 @@ export class ProviderOAuthManager {
   }
 
   private async startBrowser(flow: OAuthFlow): Promise<OAuthFlowSnapshot> {
-    const callback = LOOPBACK[flow.providerId as "anthropic" | "xai" | "google-antigravity"];
+    const callback = LOOPBACK[flow.providerId as BrowserOAuthProviderId];
     const verifier = randomSecret();
     const state = randomSecret();
-    const redirectUri = `http://127.0.0.1:${callback.port}${callback.authorizePath}`;
+    const redirectUri = oauthRedirectUri(flow.providerId as BrowserOAuthProviderId);
     flow.verifier = verifier;
     flow.state = state;
     flow.redirectUri = redirectUri;
-    flow.server = createServer((request, response) => { void this.handleBrowserCallback(flow, request, response); });
-    await this.listen(flow.server, callback.port);
+    const handler = (request: IncomingMessage, response: ServerResponse): void => { void this.handleBrowserCallback(flow, request, response); };
+    flow.servers = await this.listen(handler, callback.port, callback.hostname);
+    flow.server = flow.servers[0];
     try {
       const challenge = pkceChallenge(verifier);
       let url: string;
@@ -642,14 +654,38 @@ export class ProviderOAuthManager {
     }
   }
 
-  private async listen(server: Server, port: number): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
-      const onError = (_error: Error): void => { server.off("listening", onListening); reject(new Error(`Could not open the ${port} OAuth callback port. Close any older OpenWordCode sign-in window and try again.`)); };
-      const onListening = (): void => { server.off("error", onError); resolve(); };
-      server.once("error", onError);
-      server.once("listening", onListening);
-      server.listen(port, "127.0.0.1");
-    });
+  private async listen(handler: (request: IncomingMessage, response: ServerResponse) => void, port: number, hostname: "localhost" | "127.0.0.1"): Promise<Server[]> {
+    const hosts = hostname === "localhost" ? ["127.0.0.1", "::1"] : ["127.0.0.1"];
+    const servers: Server[] = [];
+    try {
+      for (const host of hosts) {
+        const server = createServer(handler);
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const onError = (error: Error): void => { server.off("listening", onListening); reject(error); };
+            const onListening = (): void => { server.off("error", onError); resolve(); };
+            server.once("error", onError);
+            server.once("listening", onListening);
+            server.listen(port, host);
+          });
+          servers.push(server);
+        } catch (error) {
+          try { server.close(); } catch {}
+          // IPv6 is optional on some developer machines. Keep the IPv4
+          // callback working there, but never ignore a port conflict because
+          // localhost could otherwise resolve to an unrelated process.
+          const code = (error as NodeJS.ErrnoException).code;
+          if (host === "::1" && (code === "EAFNOSUPPORT" || code === "ENOTSUP" || code === "EINVAL")) continue;
+          throw error;
+        }
+      }
+      return servers;
+    } catch {
+      for (const server of servers) {
+        try { server.close(); } catch {}
+      }
+      throw new Error(`Could not open the ${port} OAuth callback port. Close any older OpenWordCode sign-in window and try again.`);
+    }
   }
 
   private async handleBrowserCallback(flow: OAuthFlow, request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -921,10 +957,12 @@ export class ProviderOAuthManager {
   }
 
   private closeServer(flow: OAuthFlow): void {
-    if (!flow.server) return;
-    const server = flow.server;
+    const servers = flow.servers ?? (flow.server ? [flow.server] : []);
     flow.server = undefined;
-    server.close();
+    flow.servers = undefined;
+    for (const server of servers) {
+      try { server.close(); } catch {}
+    }
   }
 
   private displayName(providerId: SupportedOAuthProviderId): string {

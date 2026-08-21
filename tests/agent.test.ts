@@ -12,6 +12,10 @@ const document: DocumentSnapshot = {
   outline: [],
   capabilities: { canRead: true, canWrite: true, canComment: false, canFormat: false },
 };
+const tableDocument: DocumentSnapshot = {
+  ...document,
+  selection: { ...document.selection, isTable: true, tableCount: 1 },
+};
 
 class ScriptedProvider implements ProviderRuntime {
   readonly config = { id: "test", displayName: "Test", kind: "demo" as const, baseUrl: "demo://test", enabled: true, local: true, auth: { method: "none" as const }, privacyNote: "test" };
@@ -37,6 +41,34 @@ class GreetingProvider implements ProviderRuntime {
     this.toolCount = request.tools?.length ?? 0;
     this.effort = request.effort;
     yield { type: "text", delta: "Hi! How can I help with your Word document?" };
+    yield { type: "done" };
+  }
+}
+
+class CompactionProvider implements ProviderRuntime {
+  readonly config = { id: "compaction-test", displayName: "Compaction Test", kind: "demo" as const, baseUrl: "demo://compaction-test", enabled: true, local: true, auth: { method: "none" as const }, privacyNote: "test" };
+  compactionCalls = 0;
+  mainRequests: ProviderChatRequest[] = [];
+  async listModels() { return []; }
+  async *streamChat(request: ProviderChatRequest): AsyncGenerator<ProviderStreamEvent> {
+    if (request.messages.some(message => message.content.includes("[CONVERSATION_TO_COMPACT]"))) {
+      this.compactionCalls += 1;
+      yield { type: "text", delta: "The user is working on a Word document and wants the important earlier decisions preserved." };
+    } else {
+      this.mainRequests.push(request);
+      yield { type: "text", delta: JSON.stringify({ answer: "done", proposedChanges: [] }) };
+    }
+    yield { type: "done" };
+  }
+}
+
+class DocumentBriefProvider implements ProviderRuntime {
+  readonly config = { id: "document-brief-test", displayName: "Document Brief Test", kind: "demo" as const, baseUrl: "demo://document-brief-test", enabled: true, local: true, auth: { method: "none" as const }, privacyNote: "test" };
+  toolCount = -1;
+  async listModels() { return []; }
+  async *streamChat(request: ProviderChatRequest): AsyncGenerator<ProviderStreamEvent> {
+    this.toolCount = request.tools?.length ?? 0;
+    yield { type: "text", delta: JSON.stringify({ answer: "I would plan the tutorial document before making any edits.", proposedChanges: [] }) };
     yield { type: "done" };
   }
 }
@@ -77,7 +109,45 @@ class WholeDocumentProvider implements ProviderRuntime {
   readonly config = { id: "whole-document-test", displayName: "Whole Document Test", kind: "demo" as const, baseUrl: "demo://whole-document-test", enabled: true, local: true, auth: { method: "none" as const }, privacyNote: "test" };
   async listModels() { return []; }
   async *streamChat(): AsyncGenerator<ProviderStreamEvent> {
-    yield { type: "text", delta: JSON.stringify({ answer: "I prepared the letter.", proposedChanges: [{ type: "replace_text", targetId: "paragraph-0", before: selection, after: "Dear teacher,\n\nI will not be able to attend school tomorrow.\n\nSincerely,\nTom", description: "Replace the document with the requested letter." }] }) };
+    yield { type: "text", delta: JSON.stringify({ answer: "I prepared the letter.", proposedChanges: [{ type: "replace_text", targetId: "paragraph-0", after: "Dear teacher,\n\nI will not be able to attend school tomorrow.\n\nSincerely,\nTom", description: "Replace the document with the requested letter." }] }) };
+    yield { type: "done" };
+  }
+}
+
+class QuestionProvider implements ProviderRuntime {
+  readonly config = { id: "question-test", displayName: "Question Test", kind: "demo" as const, baseUrl: "demo://question-test", enabled: true, local: true, auth: { method: "none" as const }, privacyNote: "test" };
+  private turn = 0;
+  async listModels() { return []; }
+  async *streamChat(): AsyncGenerator<ProviderStreamEvent> {
+    this.turn += 1;
+    if (this.turn === 1) {
+      yield { type: "tool_call", call: { id: "question-tool-1", name: "ask_user_question", arguments: JSON.stringify({ question: "Which layout should I use?", header: "Layout", options: [{ label: "Two columns", description: "Image left and steps right" }, { label: "Single column", description: "Stacked sections" }], allowOther: true }) } };
+    } else {
+      yield { type: "text", delta: JSON.stringify({ answer: "I’ll use the selected layout.", proposedChanges: [] }) };
+    }
+    yield { type: "done" };
+  }
+}
+
+class ExplicitQuestionProvider implements ProviderRuntime {
+  readonly config = { id: "explicit-question-test", displayName: "Explicit Question Test", kind: "demo" as const, baseUrl: "demo://explicit-question-test", enabled: true, local: true, auth: { method: "none" as const }, privacyNote: "test" };
+  requests: ProviderChatRequest[] = [];
+  async listModels() { return []; }
+  async *streamChat(request: ProviderChatRequest): AsyncGenerator<ProviderStreamEvent> {
+    this.requests.push(request);
+    yield { type: "text", delta: JSON.stringify({ answer: "I used the selected style.", proposedChanges: [{ type: "replace_text", targetId: "selection", before: selection, after: "The customer needs to submit the form.", description: "Apply the selected style." }] }) };
+    yield { type: "done" };
+  }
+}
+
+class PlainQuestionProvider implements ProviderRuntime {
+  readonly config = { id: "plain-question-test", displayName: "Plain Question Test", kind: "demo" as const, baseUrl: "demo://plain-question-test", enabled: true, local: true, auth: { method: "none" as const }, privacyNote: "test" };
+  private turn = 0;
+  async listModels() { return []; }
+  async *streamChat(): AsyncGenerator<ProviderStreamEvent> {
+    this.turn += 1;
+    if (this.turn === 1) yield { type: "text", delta: "How should I format the document? Options: Minimal, Professional, or Bold.\n\nDo not edit until you choose." };
+    else yield { type: "text", delta: JSON.stringify({ answer: "I used the selected option.", proposedChanges: [] }) };
     yield { type: "done" };
   }
 }
@@ -101,6 +171,92 @@ describe("agent runtime", () => {
     expect(provider.toolCount).toBe(0);
     expect(provider.effort).toBe("high");
     expect(result.answer).toBe("Hi! How can I help with your Word document?");
+  });
+
+  it("pauses for an interactive clarification and resumes the same run", async () => {
+    const provider = new QuestionProvider();
+    let askedQuestion = "";
+    const result = await runAgent({
+      provider,
+      modelId: "test",
+      instruction: "What should I know about this document?",
+      mode: "manual",
+      document,
+      askUser: async question => {
+        askedQuestion = question.question;
+        expect(question.options.map(option => option.label)).toEqual(["Two columns", "Single column"]);
+        expect(question.allowOther).toBe(true);
+        return "Two columns";
+      },
+    });
+    expect(askedQuestion).toBe("Which layout should I use?");
+    expect(result.answer).toContain("selected layout");
+  });
+
+  it("pauses before editing when the user explicitly asks for choices", async () => {
+    const provider = new ExplicitQuestionProvider();
+    let askedQuestion: string | undefined;
+    const result = await runAgent({
+      provider,
+      modelId: "test",
+      instruction: "I want to redesign the selected table, but first ask me which style to use. Show these choices: Minimal monochrome, Professional blue, or Warm orange. Do not edit the document until I choose.",
+      mode: "manual",
+      document: tableDocument,
+      askUser: async question => {
+        askedQuestion = question.question;
+        expect(question.options.map(option => option.label)).toEqual(["Minimal monochrome", "Professional blue", "Warm orange"]);
+        return "Professional blue";
+      },
+    });
+    expect(askedQuestion).toBe("Which style to use?");
+    expect(result.changes).toHaveLength(1);
+    expect(provider.requests).toHaveLength(0);
+    expect(result.changes[0]?.operation).toMatchObject({ name: "styleBuiltIn", scope: "table", value: "GridTable4_Accent1" });
+  });
+
+  it("converts a provider's plain-text options into the interactive question", async () => {
+    const provider = new PlainQuestionProvider();
+    let askedQuestion: string | undefined;
+    const result = await runAgent({
+      provider,
+      modelId: "test",
+      instruction: "What should I choose?",
+      mode: "manual",
+      document,
+      askUser: async question => {
+        askedQuestion = question.question;
+        expect(question.options.map(option => option.label)).toEqual(["Minimal", "Professional", "Bold"]);
+        return "Bold";
+      },
+    });
+    expect(askedQuestion).toBe("How should I format the document?");
+    expect(result.answer).toContain("selected option");
+  });
+
+  it("compacts older conversation turns before reaching the model context limit", async () => {
+    const provider = new CompactionProvider();
+    const conversation = Array.from({ length: 12 }, (_value, index) => ({
+      role: index % 2 === 0 ? "user" as const : "assistant" as const,
+      content: `Older conversation turn ${index}. ${"The user is refining a long Word document and wants the important requirements retained. ".repeat(80)}`,
+    }));
+    const events: Array<{ type: string; phase?: "compacting" | "ready"; compacted?: boolean; summarizedMessages?: number }> = [];
+    const result = await runAgent({
+      provider,
+      modelId: "test",
+      contextWindow: 8_000,
+      instruction: "hi",
+      mode: "manual",
+      document,
+      conversation,
+      onEvent: event => events.push(event),
+    });
+    const mainRequest = provider.mainRequests.at(-1);
+    expect(result.answer).toBe("done");
+    expect(provider.compactionCalls).toBeGreaterThan(0);
+    expect(mainRequest?.messages.some(message => message.content.includes("[COMPACTED_CONVERSATION_MEMORY]"))).toBe(true);
+    expect(events.some(event => event.type === "context" && event.phase === "compacting")).toBe(true);
+    expect(events.some(event => event.type === "context" && event.phase === "ready")).toBe(true);
+    expect(events.some(event => event.type === "context" && event.compacted === true && (event.summarizedMessages ?? 0) > 0)).toBe(true);
   });
 
   it("keeps manual approval changes pending", async () => {
@@ -156,6 +312,20 @@ describe("agent runtime", () => {
     ]);
   });
 
+  it("does not reduce a broader document brief to a default table", async () => {
+    const provider = new DocumentBriefProvider();
+    const result = await runAgent({
+      provider,
+      modelId: "test",
+      instruction: "Prepare a tutorial pattern, search online for a template, include an image, a materials page, short steps, a table layout, and a footer.",
+      mode: "manual",
+      document,
+    });
+    expect(result.answer).not.toContain("3×4");
+    expect(result.changes).toHaveLength(0);
+    expect(provider.toolCount).toBeGreaterThan(0);
+  });
+
   it("turns an empty-text table selection into a table deletion proposal", async () => {
     const tableDocument: DocumentSnapshot = {
       ...document,
@@ -178,6 +348,21 @@ describe("agent runtime", () => {
     expect(result.changes[0]?.operation).toEqual({ name: "fillTable", scope: "table", args: [{ mode: "sequence", start: 1, step: 1 }] });
   });
 
+  it("resizes the selected table instead of inserting a nested table", async () => {
+    const result = await runAgent({
+      provider: new ScriptedProvider(),
+      modelId: "test",
+      instruction: "redesign my table please make it 4 x 4 instead and design color it better",
+      mode: "manual",
+      document: tableDocument,
+    });
+    expect(result.answer).toContain("selected table");
+    expect(result.changes).toHaveLength(1);
+    expect(result.changes[0]?.operation).toMatchObject({ name: "resizeTable", scope: "table" });
+    expect(result.changes[0]?.operation?.args?.[0]).toMatchObject({ rows: 4, columns: 4, preserveContent: true, styleBuiltIn: "GridTable4_Accent1" });
+    expect(result.changes[0]?.operation?.name).not.toBe("insertTable");
+  });
+
   it("targets the whole document for a clear-all request", async () => {
     const documentWithText: DocumentSnapshot = { ...document, documentText: "First paragraph\nSecond paragraph" };
     const result = await runAgent({ provider: new ScriptedProvider(), modelId: "test", instruction: "Delete all text from the document", mode: "manual", document: documentWithText });
@@ -196,5 +381,19 @@ describe("agent runtime", () => {
 
     const hebrewResult = await runAgent({ provider: new WholeDocumentProvider(), modelId: "test", instruction: "תמחק את הכל ותכניס מכתב חדש במקום התוכן הקיים", mode: "manual", document: documentWithText });
     expect(hebrewResult.changes[0]?.target.kind).toBe("document");
+  });
+
+  it("creates content in an empty document instead of returning only a plan", async () => {
+    const emptyDocument: DocumentSnapshot = {
+      ...document,
+      documentText: "",
+      selection: { ...document.selection, text: "", isEmpty: true, target: { kind: "selection", id: "selection", beforeText: "", beforeFingerprint: textFingerprint("") } },
+      paragraphs: [{ id: "paragraph-0", index: 0, text: "" }],
+    };
+    const result = await runAgent({ provider: new WholeDocumentProvider(), modelId: "test", instruction: "Design a tutorial pattern with a table and pages", mode: "manual", document: emptyDocument });
+    expect(result.changes).toHaveLength(1);
+    expect(result.changes[0]?.target.kind).toBe("document");
+    expect(result.changes[0]?.before).toBe("");
+    expect(result.changes[0]?.after).toContain("Dear teacher");
   });
 });

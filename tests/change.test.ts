@@ -29,4 +29,11 @@ describe("change approval", () => {
     store.add({ ...change(), id: "hebrew-change", target: { kind: "paragraph", id: "paragraph-0", paragraphIndex: 0, beforeText: before, beforeFingerprint: textFingerprint(before) }, before });
     expect(store.approve("hebrew-change", `${before}\u200f\r`).status).toBe("approved");
   });
+
+  it("accepts serialization-only normalization for selection targets", () => {
+    const before = "Original wording";
+    const store = new ChangeStore();
+    store.add({ ...change(), id: "selection-normalized", before, target: { kind: "selection", id: "selection", beforeText: before, beforeFingerprint: textFingerprint(before) } });
+    expect(store.approve("selection-normalized", `${before}\u200f\r`).status).toBe("approved");
+  });
 });

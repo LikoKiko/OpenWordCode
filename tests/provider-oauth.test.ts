@@ -3,6 +3,7 @@ import { MemoryCredentialStore, type CredentialStore, type CredentialWriteOption
 import type { ProviderConfig } from "../packages/shared/src/index.js";
 import {
   nextDevicePollInterval,
+  oauthRedirectUri,
   oauthProviderCatalog,
   ProviderOAuthManager,
   validateXaiOAuthEndpoint,
@@ -21,6 +22,12 @@ const nousProvider: ProviderConfig = {
 };
 
 describe("provider OAuth reliability", () => {
+  it("uses the hostname registered by each browser OAuth client", () => {
+    expect(oauthRedirectUri("anthropic")).toBe("http://localhost:54545/callback");
+    expect(oauthRedirectUri("xai")).toBe("http://127.0.0.1:56121/callback");
+    expect(oauthRedirectUri("google-antigravity")).toBe("http://127.0.0.1:51121/callback");
+  });
+
   it("publishes every enabled account connector as supported", () => {
     const supported = oauthProviderCatalog().filter(provider => provider.supported).map(provider => provider.id);
     expect(supported).toEqual(["anthropic", "xai", "kimi", "google-antigravity", "github-copilot", "nous"]);

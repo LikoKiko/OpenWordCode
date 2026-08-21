@@ -183,6 +183,11 @@ export async function approveChange(id: string, currentBefore: string): Promise<
   return payload.change;
 }
 
+export async function rejectChange(id: string): Promise<ProposedChange> {
+  const payload = await request<{ change: ProposedChange }>(`/api/changes/${encodeURIComponent(id)}/reject`, { method: "POST", body: "{}" });
+  return payload.change;
+}
+
 export async function completeChange(id: string, success: boolean, reason?: string): Promise<ProposedChange> {
   const payload = await request<{ change: ProposedChange }>(`/api/changes/${encodeURIComponent(id)}/complete`, { method: "POST", body: JSON.stringify({ success, reason }) });
   return payload.change;
@@ -222,6 +227,13 @@ export async function streamAgent(requestBody: AgentRequest, onEvent: (event: Ag
       try { onEvent(JSON.parse(line.slice(5).trim()) as AgentEvent); } catch { /* ignore malformed frame */ }
     }
   }
+}
+
+export async function answerAgentQuestion(runId: string, questionId: string, answer: string): Promise<void> {
+  await request(`/api/agent/${encodeURIComponent(runId)}/question`, {
+    method: "POST",
+    body: JSON.stringify({ questionId, answer }),
+  });
 }
 
 export type { DocumentSnapshot };

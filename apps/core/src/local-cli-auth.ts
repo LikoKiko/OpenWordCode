@@ -261,11 +261,16 @@ function spawnDetached(executable: string, args: string[]): Promise<void> {
   });
 }
 
-function spawnVisibleWindows(executable: string, args: string[], env: NodeJS.ProcessEnv, title: string): Promise<void> {
-  const command = invocation(executable, args);
-  const quote = (value: string): string => `"${value.replaceAll('"', '\\\"')}"`;
-  const line = `start "${title.replaceAll('"', "")}" ${quote(command.executable)} ${command.args.map(quote).join(" ")}`;
-  return spawnDetached(env.ComSpec?.trim() || "cmd.exe", ["/d", "/c", line]);
+function spawnVisibleWindows(executable: string, args: string[]): Promise<void> {
+  // Do not wrap this in `start "title" ...`. `start` treats the first quoted
+  // argument as a window title and the quoting becomes especially fragile when
+  // the CLI itself is a .cmd/.bat wrapper. That was launching the literal text
+  // "Claude Code sign-in" instead of Claude Code on Windows.
+  //
+  // `invocation` already resolves .cmd/.bat/.ps1 files to the correct host, and
+  // `spawnDetached` keeps the process visible so the CLI can open its browser
+  // login flow normally.
+  return spawnDetached(executable, args);
 }
 
 /** Starts the official CLI's own login flow after an explicit user action. */
@@ -281,7 +286,7 @@ export async function launchLocalCliLogin(
     throw new Error(`${name} was not found. Install it, then try again, or set ${variable} to its executable.`);
   }
   const args = providerId === "google-antigravity" ? [] : ["login"];
-  if (process.platform === "win32") await spawnVisibleWindows(executable, args, env, `${localCliDisplayName(providerId)} sign-in`);
+  if (process.platform === "win32") await spawnVisibleWindows(executable, args);
   else await spawnDetached(executable, args);
   return { providerId, executable, command: displayCommand(invocation(executable, args).executable, invocation(executable, args).args) };
 }

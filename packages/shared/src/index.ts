@@ -102,9 +102,55 @@ export interface ChatMessage {
 export interface ChatAttachment {
   id: string;
   name: string;
-  mimeType: "application/pdf" | "image/gif" | "image/jpeg" | "image/png" | "image/webp";
+  mimeType: "text/plain" | "application/pdf" | "image/gif" | "image/jpeg" | "image/png" | "image/webp";
   size: number;
   dataUrl: string;
+}
+
+/** Used when a provider does not expose its context window in model metadata. */
+export const DEFAULT_CONTEXT_WINDOW = 128_000;
+/** Maximum size of one user instruction accepted by the local Core API. */
+export const MAX_INSTRUCTION_CHARS = 50_000;
+
+/**
+ * A deliberately conservative, provider-neutral token estimate.
+ * Provider tokenizers differ, so UI copy should describe values from this
+ * helper as estimates rather than billing or quota measurements.
+ */
+export function estimateTokenCount(value: string): number {
+  if (!value) return 0;
+  let asciiCharacters = 0;
+  let nonAsciiCharacters = 0;
+  for (const character of value) {
+    if ((character.codePointAt(0) ?? 0) <= 0x7f) asciiCharacters += 1;
+    else nonAsciiCharacters += 1;
+  }
+  return Math.ceil(asciiCharacters / 4 + nonAsciiCharacters / 2);
+}
+
+export function estimateMessageTokens(messages: readonly ChatMessage[]): number {
+  return messages.reduce((total, message) => total
+    + 4
+    + estimateTokenCount(message.content)
+    + (message.toolCalls?.length ? message.toolCalls.length * 8 : 0), 0);
+}
+
+/** Approximate input cost for binary files that providers encode separately. */
+export function estimateAttachmentTokens(attachment: Pick<ChatAttachment, "mimeType" | "size">): number {
+  const divisor = attachment.mimeType === "application/pdf" || attachment.mimeType === "text/plain" ? 4 : 1_500;
+  const estimate = Math.ceil(attachment.size / divisor);
+  return Math.min(16_000, Math.max(256, estimate));
+}
+
+export function formatTokenCount(value: number): string {
+  const safeValue = Math.max(0, Math.round(value));
+  if (safeValue < 1_000) return String(safeValue);
+  if (safeValue < 1_000_000) {
+    const formatted = (safeValue / 1_000).toFixed(safeValue < 10_000 ? 1 : 0);
+    return `${formatted.replace(/\.0$/u, "")}k`;
+  }
+  const formatted = (safeValue / 1_000_000).toFixed(safeValue < 10_000_000 ? 1 : 0);
+  return `${formatted.replace(/\.0$/u, "")}m`;
 }
 
 export interface SkillSummary {
@@ -160,7 +206,7 @@ export interface DocumentVisualElement {
   altTextDescription?: string;
   hyperlink?: string;
   imageFormat?: string;
-  mimeType?: Exclude<ChatAttachment["mimeType"], "application/pdf">;
+  mimeType?: Exclude<ChatAttachment["mimeType"], "application/pdf" | "text/plain">;
   width?: number;
   height?: number;
   /** Floating-shape horizontal position in Word points. */
@@ -243,7 +289,7 @@ export const WORD_RANGE_METHODS = [
  * the model can request the operation, but it is never forwarded to an
  * Office.js object with an arbitrary method name.
  */
-export const WORD_TABLE_OPERATIONS = ["fillTable"] as const;
+export const WORD_TABLE_OPERATIONS = ["fillTable", "resizeTable"] as const;
 
 /** Structured visual operations implemented by the Word adapter. */
 export const WORD_VISUAL_OPERATIONS = [
@@ -325,9 +371,24 @@ export interface ProposedChange {
 
 export type AgentMode = "manual" | "auto" | "skip";
 
+export interface AgentQuestionOption {
+  label: string;
+  description?: string;
+}
+
+/** A structured clarification request that pauses an active agent run. */
+export interface AgentQuestion {
+  id: string;
+  header?: string;
+  question: string;
+  options: AgentQuestionOption[];
+  allowOther: boolean;
+}
+
 export interface AgentRequest {
   providerId: ProviderId;
   modelId: string;
+  contextWindow?: number;
   instruction: string;
   mode: AgentMode;
   document: DocumentSnapshot;
@@ -359,6 +420,8 @@ export type AgentEvent =
   | { type: "status"; message: string }
   | { type: "token"; delta: string }
   | { type: "tool"; name: string; state: "started" | "completed"; detail?: string }
+  | { type: "context"; usedTokens: number; contextWindow: number; estimated?: boolean; phase?: "compacting" | "ready"; compacted?: boolean; summarizedMessages?: number }
+  | { type: "question"; runId: string; question: AgentQuestion }
   | { type: "proposal"; change: ProposedChange }
   | { type: "action"; action: AgentAction }
   | { type: "done"; answer: string; changes: ProposedChange[]; actions?: AgentAction[]; truncated?: boolean }

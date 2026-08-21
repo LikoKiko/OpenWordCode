@@ -53,7 +53,7 @@ describe("Core API", () => {
     await app.close();
   });
 
-  it("accepts bounded image and PDF review attachments", async () => {
+  it("accepts bounded text, image, and PDF review attachments", async () => {
     const directory = mkdtempSync(join(tmpdir(), "openwordcode-attachments-test-"));
     created.push(directory);
     const app = await buildServer(createCoreState({ ...process.env, OPENWORDCODE_DATA_DIR: directory }));
@@ -61,7 +61,7 @@ describe("Core API", () => {
     const token = (bootstrap.json() as { sessionToken: string }).sessionToken;
     const headers = { origin: "http://127.0.0.1:10200", "x-openwordcode-session": token, "x-openwordcode-csrf": token, "content-type": "application/json" };
     const text = "Review the attachment.";
-    const response = await app.inject({ method: "POST", url: "/api/agent", headers, payload: { providerId: "demo", modelId: "demo-rewrite", instruction: text, mode: "manual", attachments: [{ id: "image-1", name: "chart.png", mimeType: "image/png", size: 1, dataUrl: "data:image/png;base64,AA==" }, { id: "pdf-1", name: "brief.pdf", mimeType: "application/pdf", size: 1, dataUrl: "data:application/pdf;base64,AA==" }], document: { documentId: "test", selection: { text: "", isEmpty: true, selectedVisualElementIds: ["inline-picture-0"], target: { kind: "selection", id: "selection", beforeText: "", beforeFingerprint: "ignored" } }, documentText: "", paragraphs: [], visualElements: [{ id: "inline-picture-0", kind: "inlinePicture", index: 0, width: 72, height: 72, mimeType: "image/png", size: 1, dataUrl: "data:image/png;base64,AA==", contentAvailable: true }], outline: [], capabilities: { canRead: true, canWrite: true, canComment: false, canFormat: false } } } });
+    const response = await app.inject({ method: "POST", url: "/api/agent", headers, payload: { providerId: "demo", modelId: "demo-rewrite", instruction: text, mode: "manual", attachments: [{ id: "text-1", name: "request.txt", mimeType: "text/plain", size: 4, dataUrl: "data:text/plain;base64,VGVzdA==" }, { id: "image-1", name: "chart.png", mimeType: "image/png", size: 1, dataUrl: "data:image/png;base64,AA==" }, { id: "pdf-1", name: "brief.pdf", mimeType: "application/pdf", size: 1, dataUrl: "data:application/pdf;base64,AA==" }], document: { documentId: "test", selection: { text: "", isEmpty: true, selectedVisualElementIds: ["inline-picture-0"], target: { kind: "selection", id: "selection", beforeText: "", beforeFingerprint: "ignored" } }, documentText: "", paragraphs: [], visualElements: [{ id: "inline-picture-0", kind: "inlinePicture", index: 0, width: 72, height: 72, mimeType: "image/png", size: 1, dataUrl: "data:image/png;base64,AA==", contentAvailable: true }], outline: [], capabilities: { canRead: true, canWrite: true, canComment: false, canFormat: false } } } });
     expect(response.statusCode).toBe(200);
     expect(response.body).toContain('"type":"done"');
     await app.close();

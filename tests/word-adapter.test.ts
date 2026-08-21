@@ -11,6 +11,8 @@ describe("memory Word adapter", () => {
     expect(applied.success).toBe(true);
     expect((await adapter.readSnapshot()).selection.text).toBe("the customer needs help");
     expect(textFingerprint((await adapter.readSnapshot()).selection.text)).not.toBe(snapshot.selection.target.beforeFingerprint);
+    expect((await adapter.revertChange(change)).success).toBe(true);
+    expect((await adapter.readSnapshot()).selection.text).toBe("customers needs help");
   });
 
   it("fails closed when the target is stale", async () => {
@@ -19,6 +21,14 @@ describe("memory Word adapter", () => {
     adapter.setSelection("new");
     const result = await adapter.applyChange({ id: "change", type: "replace_text", target: snapshot.selection.target, description: "test", before: "old", after: "updated", status: "approved", createdAt: new Date().toISOString() });
     expect(result.success).toBe(false);
+  });
+
+  it("allows Word serialization-only changes to a selection", async () => {
+    const adapter = new MemoryWordAdapter({ selection: "old" });
+    const snapshot = await adapter.readSnapshot();
+    adapter.setSelection("old\u200f\r");
+    const result = await adapter.applyChange({ id: "normalized", type: "replace_text", target: snapshot.selection.target, description: "test", before: "old", after: "updated", status: "approved", createdAt: new Date().toISOString() });
+    expect(result.success).toBe(true);
   });
 
   it("applies inserted text to an empty selection", async () => {
@@ -422,6 +432,19 @@ describe("memory Word adapter", () => {
       });
       expect(result.success).toBe(true);
       expect(table.styleBuiltIn).toBe("GridTable4_Accent1");
+
+      const argsResult = await adapter.applyChange({
+        id: "office-style-table-args",
+        type: "range_operation",
+        target: snapshot.selection.target,
+        description: "Style the selected table from the operation arguments",
+        before: "",
+        operation: { name: "styleBuiltIn", scope: "table", args: ["GridTable4_Accent1"] },
+        status: "approved",
+        createdAt: new Date().toISOString(),
+      });
+      expect(argsResult.success).toBe(true);
+      expect(table.styleBuiltIn).toBe("GridTable4_Accent1");
     } finally {
       if (previousOffice === undefined) delete (globalThis as { Office?: unknown }).Office;
       else (globalThis as { Office?: unknown }).Office = previousOffice;
@@ -483,6 +506,172 @@ describe("memory Word adapter", () => {
       else (globalThis as { Office?: unknown }).Office = previousOffice;
       if (previousWord === undefined) delete (globalThis as { Word?: unknown }).Word;
       else (globalThis as { Word?: unknown }).Word = previousWord;
+    }
+  });
+
+  it("resizes the selected Word table in place without creating a nested table", async () => {
+    const table = {
+      isNullObject: false,
+      rowCount: 2,
+      columnCount: 2,
+      values: [["A", "B"], ["C", "D"]],
+      styleBuiltIn: "TableGrid",
+      load: () => undefined,
+      addRows(_location: string, count: number) {
+        this.values = [...(this.values ?? []), ...Array.from({ length: count }, () => Array.from({ length: this.columnCount }, () => ""))];
+        this.rowCount += count;
+      },
+      addColumns(_location: string, count: number) {
+        this.values = (this.values ?? []).map(row => [...row, ...Array.from({ length: count }, () => "")]);
+        this.columnCount += count;
+      },
+      deleteRows(start: number, count?: number) {
+        this.values = (this.values ?? []).slice(0, start);
+        if (count) this.values = this.values.slice(0, Math.max(0, this.values.length - count));
+        this.rowCount = this.values.length;
+      },
+      deleteColumns(start: number, count?: number) {
+        this.values = (this.values ?? []).map(row => row.slice(0, start));
+        if (count) this.values = this.values.map(row => row.slice(0, Math.max(0, row.length - count)));
+        this.columnCount = this.values[0]?.length ?? 0;
+      },
+    };
+    const selection = {
+      text: "",
+      load: () => undefined,
+      tables: { items: [table], load: () => undefined },
+      insertText: () => undefined,
+    };
+    const body = { text: "", load: () => undefined, paragraphs: { items: [], load: () => undefined } };
+    const context = { document: { getSelection: () => selection, body }, sync: async () => undefined };
+    const previousOffice = (globalThis as unknown as { Office?: unknown }).Office;
+    const previousWord = (globalThis as unknown as { Word?: unknown }).Word;
+    (globalThis as unknown as { Office?: unknown }).Office = { host: "Word", platform: "Windows", context: { requirements: { isSetSupported: () => false } } };
+    (globalThis as unknown as { Word?: unknown }).Word = { run: async (callback: (value: typeof context) => Promise<unknown>) => callback(context) };
+    try {
+      const adapter = new OfficeWordAdapter();
+      const snapshot = await adapter.readSnapshot();
+      const result = await adapter.applyChange({
+        id: "office-resize-table",
+        type: "range_operation",
+        target: snapshot.selection.target,
+        description: "Safely handle a provider table insertion on the selected table",
+        before: "",
+        operation: { name: "insertTable", args: [4, 4, "After", [["A", "B"], ["C", "D"]]] },
+        status: "approved",
+        createdAt: new Date().toISOString(),
+      });
+      expect(result.success).toBe(true);
+      expect(table.rowCount).toBe(4);
+      expect(table.columnCount).toBe(4);
+      expect(table.values).toEqual([
+        ["A", "B", "", ""],
+        ["C", "D", "", ""],
+        ["", "", "", ""],
+        ["", "", "", ""],
+      ]);
+      const styled = await adapter.applyChange({
+        id: "office-resize-table-style",
+        type: "range_operation",
+        target: snapshot.selection.target,
+        description: "Style selected table",
+        before: "",
+        operation: { name: "resizeTable", scope: "table", args: [{ rows: 4, columns: 4, preserveContent: true, styleBuiltIn: "GridTable4_Accent1" }] },
+        status: "approved",
+        createdAt: new Date().toISOString(),
+      });
+      expect(styled.success).toBe(true);
+      expect(table.styleBuiltIn).toBe("GridTable4_Accent1");
+    } finally {
+      if (previousOffice === undefined) delete (globalThis as unknown as { Office?: unknown }).Office;
+      else (globalThis as unknown as { Office?: unknown }).Office = previousOffice;
+      if (previousWord === undefined) delete (globalThis as unknown as { Word?: unknown }).Word;
+      else (globalThis as unknown as { Word?: unknown }).Word = previousWord;
+    }
+  });
+
+  it("falls back to table rows and cells when Word hides rowCount and values", async () => {
+    let grid = [["A", "B", "C"], ["D", "E", "F"]];
+    const rowsCollection: { items: Array<{ cells: { items: Array<{ body: { text: string; load: () => void; insertText: (text: string, mode: string) => void } }>; load: () => void } }>; load: () => void } = {
+      items: [],
+      load: () => undefined,
+    };
+    const syncRows = () => {
+      rowsCollection.items = grid.map(row => ({
+        cells: {
+          items: row.map(value => {
+            const body = {
+              text: value,
+              load: () => undefined,
+              insertText(text: string, _mode: string) { body.text = text; },
+            };
+            return { body };
+          }),
+          load: () => undefined,
+        },
+      }));
+    };
+    syncRows();
+    const table = {
+      isNullObject: false,
+      styleBuiltIn: "TableGrid",
+      rows: rowsCollection,
+      load: () => undefined,
+      addRows(_location: string, count: number) {
+        grid = [...grid, ...Array.from({ length: count }, () => Array.from({ length: grid[0]?.length ?? 0 }, () => ""))];
+        syncRows();
+      },
+      addColumns(_location: string, count: number) {
+        grid = grid.map(row => [...row, ...Array.from({ length: count }, () => "")]);
+        syncRows();
+      },
+      deleteRows(start: number, count?: number) {
+        grid.splice(start, count ?? 1);
+        syncRows();
+      },
+      deleteColumns(start: number, count?: number) {
+        for (const row of grid) row.splice(start, count ?? 1);
+        syncRows();
+      },
+    };
+    const selection = {
+      text: "",
+      load: () => undefined,
+      tables: { items: [table], load: () => undefined },
+      insertText: () => undefined,
+    };
+    const body = { text: "", load: () => undefined, paragraphs: { items: [], load: () => undefined } };
+    const context = { document: { getSelection: () => selection, body }, sync: async () => undefined };
+    const previousOffice = (globalThis as unknown as { Office?: unknown }).Office;
+    const previousWord = (globalThis as unknown as { Word?: unknown }).Word;
+    (globalThis as unknown as { Office?: unknown }).Office = { host: "Word", platform: "Windows", context: { requirements: { isSetSupported: () => false } } };
+    (globalThis as unknown as { Word?: unknown }).Word = { run: async (callback: (value: typeof context) => Promise<unknown>) => callback(context) };
+    try {
+      const adapter = new OfficeWordAdapter();
+      const snapshot = await adapter.readSnapshot();
+      const result = await adapter.applyChange({
+        id: "office-resize-table-row-fallback",
+        type: "range_operation",
+        target: snapshot.selection.target,
+        description: "Resize a selected table on an older Word host",
+        before: "",
+        operation: { name: "resizeTable", scope: "table", args: [{ rows: 4, columns: 5, preserveContent: true, styleBuiltIn: "GridTable4_Accent1" }] },
+        status: "approved",
+        createdAt: new Date().toISOString(),
+      });
+      expect(result.success).toBe(true);
+      expect(grid).toEqual([
+        ["A", "B", "C", "", ""],
+        ["D", "E", "F", "", ""],
+        ["", "", "", "", ""],
+        ["", "", "", "", ""],
+      ]);
+      expect(table.styleBuiltIn).toBe("GridTable4_Accent1");
+    } finally {
+      if (previousOffice === undefined) delete (globalThis as unknown as { Office?: unknown }).Office;
+      else (globalThis as unknown as { Office?: unknown }).Office = previousOffice;
+      if (previousWord === undefined) delete (globalThis as unknown as { Word?: unknown }).Word;
+      else (globalThis as unknown as { Word?: unknown }).Word = previousWord;
     }
   });
 });

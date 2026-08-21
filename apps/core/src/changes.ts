@@ -31,7 +31,8 @@ export class ChangeStore {
     const change = this.require(id);
     if (change.status !== "pending") throw new Error(`change is already ${change.status}`);
     const expected = change.before ?? change.target.beforeText;
-    const normalizedEquivalent = (change.target.kind === "paragraph" || change.target.kind === "document") && comparableText(currentBefore) === comparableText(expected);
+    const normalizedEquivalent = (change.target.kind === "selection" || change.target.kind === "paragraph" || change.target.kind === "document")
+      && comparableText(currentBefore) === comparableText(expected);
     if ((!normalizedEquivalent && currentBefore !== expected) || (!normalizedEquivalent && textFingerprint(currentBefore) !== change.target.beforeFingerprint)) throw new StaleChangeError();
     return this.transition(id, "approved");
   }

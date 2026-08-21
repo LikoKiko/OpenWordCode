@@ -33,6 +33,27 @@ project, another application's proxy, browser cookies, or credential files.
 - Keep provider credentials in the local Core credential store instead of the
   Word task pane.
 
+### Feature highlights
+
+- Switch between multiple connected providers from the task pane and show the
+  models available for the selected provider.
+- Choose manual approval, automatic approval with safety pauses, or skip all
+  approvals for document actions.
+- Start new tasks, reopen chat history, delete individual conversations, or
+  clear the local history.
+- Use interactive clarification cards when the agent needs a choice before it
+  continues working.
+- See a live context meter and compact long conversations automatically with a
+  visible compacting state before the task resumes.
+- Drag files and images into the chat, paste images with Ctrl+V, attach PDFs,
+  and open image previews in a larger viewer.
+- Copy answers and revert supported document changes from the task pane.
+- Work with selected Word text, tables, pictures, and document layout data;
+  table operations prefer editing the selected table in place instead of
+  inserting an unrelated nested table.
+- Use a compact responsive task pane with shared design tokens, keyboard
+  shortcuts, accessible controls, and runtime Office.js capability checks.
+
 The project does not promise that every preview member of `Word.Range` works on
 every Word build. Office.js capabilities are checked at runtime and unsupported
 operations fail clearly instead of being silently faked.

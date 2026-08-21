@@ -19,6 +19,7 @@ export interface WordApplicationAdapter {
   readonly kind: "office" | "memory";
   readSnapshot(): Promise<DocumentSnapshot>;
   applyChange(change: ProposedChange): Promise<{ success: boolean; message?: string }>;
+  revertChange(change: ProposedChange): Promise<{ success: boolean; message?: string }>;
   diagnostics(): Record<string, string | boolean | undefined>;
 }
 
@@ -99,6 +100,17 @@ interface OfficeTableLike {
   isNullObject?: boolean;
   style?: string;
   styleBuiltIn?: string;
+  rowCount?: number;
+  columnCount?: number;
+  values?: string[][];
+  headerRowCount?: number;
+  styleBandedRows?: boolean;
+  styleFirstColumn?: boolean;
+  styleLastColumn?: boolean;
+  addRows?(insertLocation: string, rowCount: number, values?: string[][]): unknown;
+  addColumns?(insertLocation: string, columnCount: number, values?: string[][]): unknown;
+  deleteRows?(rowIndex: number, rowCount?: number): unknown;
+  deleteColumns?(columnIndex: number, columnCount?: number): unknown;
   rows?: OfficeTableRowCollectionLike;
   load(properties: string): void;
   delete?(): void;
@@ -116,6 +128,7 @@ interface OfficeTableRowCollectionLike {
 
 interface OfficeTableRowLike {
   cells?: OfficeTableCellCollectionLike;
+  cellCount?: number;
 }
 
 interface OfficeTableCellCollectionLike {
@@ -128,6 +141,8 @@ interface OfficeTableCellLike {
 }
 
 interface OfficeTableCellBodyLike {
+  text?: string;
+  load?(properties: string): void;
   insertText(text: string, mode: string): unknown;
 }
 
@@ -147,6 +162,7 @@ interface OfficeDocumentLike {
   body: OfficeBodyLike;
   load?(properties: string): void;
   changeTrackingMode?: string;
+  undo?(times?: number): OfficeClientResultLike<boolean>;
 }
 
 interface OfficeContextLike {
@@ -680,6 +696,14 @@ function tableHtml(values: string[][]): string {
 
 type TableFillSource = string[][] | { mode: "sequence"; start: number; step: number };
 
+interface TableResizeInput {
+  rows: number;
+  columns: number;
+  preserveContent: boolean;
+  values?: string[][];
+  styleBuiltIn?: string;
+}
+
 function normalizedTableValues(value: unknown): string[][] | null {
   if (!Array.isArray(value)) return null;
   const rows = value
@@ -724,6 +748,94 @@ function tableFillSource(operation: WordRangeOperation): TableFillSource | null 
   return null;
 }
 
+function tableResizeInput(operation: WordRangeOperation): TableResizeInput | null {
+  const source = operation.name === "insertTable"
+    ? { rows: operation.args?.[0], columns: operation.args?.[1], values: normalizedTableValues(operation.args?.[3]), preserveContent: true }
+    : operation.value !== undefined ? operation.value : operation.args?.[0];
+  if (!source || typeof source !== "object" || Array.isArray(source)) return null;
+  const descriptor = source as { rows?: unknown; columns?: unknown; preserveContent?: unknown; values?: unknown; styleBuiltIn?: unknown; style?: unknown };
+  const rows = Number(descriptor.rows);
+  const columns = Number(descriptor.columns);
+  if (!Number.isInteger(rows) || rows < 1 || rows > 100 || !Number.isInteger(columns) || columns < 1 || columns > 100) return null;
+  const styleBuiltIn = descriptor.styleBuiltIn ?? descriptor.style;
+  if (styleBuiltIn !== undefined && typeof styleBuiltIn !== "string") return null;
+  const values = normalizedTableValues(descriptor.values);
+  return {
+    rows,
+    columns,
+    preserveContent: descriptor.preserveContent !== false,
+    ...(values ? { values } : {}),
+    ...(typeof styleBuiltIn === "string" ? { styleBuiltIn } : {}),
+  };
+}
+
+interface OfficeTableGrid {
+  rows: number;
+  columns: number;
+  values?: string[][];
+}
+
+function officeCellText(cell: OfficeTableCellLike): string {
+  return String(cell.body?.text ?? "").replace(/\r/gu, "");
+}
+
+async function loadOfficeTableRows(context: OfficeContextLike, table: OfficeTableLike, includeText: boolean): Promise<OfficeTableRowLike[] | null> {
+  if (!table.rows || typeof table.rows.load !== "function") return null;
+  table.rows.load("items");
+  await context.sync();
+  const rows = table.rows.items ?? [];
+  if (!rows.length) return [];
+  for (const row of rows) row.cells?.load("items");
+  await context.sync();
+  if (includeText) {
+    for (const row of rows) {
+      for (const cell of row.cells?.items ?? []) cell.body?.load?.("text");
+    }
+    await context.sync();
+  }
+  return rows;
+}
+
+async function discoverOfficeTableGrid(context: OfficeContextLike, table: OfficeTableLike): Promise<OfficeTableGrid | null> {
+  try {
+    const rows = await loadOfficeTableRows(context, table, true);
+    if (!rows?.length) return null;
+    const cellsByRow = rows.map(row => row.cells?.items ?? []);
+    const columns = Math.max(...cellsByRow.map((cells, index) => Math.max(cells.length, Number(rows[index]?.cellCount) || 0)), 0);
+    if (!columns) return null;
+    const values = cellsByRow.map(cells => Array.from({ length: columns }, (_cell, index) => {
+      const cell = cells[index];
+      return cell ? officeCellText(cell) : "";
+    }));
+    return { rows: rows.length, columns, values };
+  } catch {
+    return null;
+  }
+}
+
+async function writeOfficeTableValues(context: OfficeContextLike, table: OfficeTableLike, values: string[][]): Promise<boolean> {
+  if (table.values !== undefined) {
+    table.values = values;
+    return true;
+  }
+  try {
+    const rows = await loadOfficeTableRows(context, table, false);
+    if (!rows?.length) return false;
+    let writableCells = 0;
+    for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+      for (let columnIndex = 0; columnIndex < (rows[rowIndex]?.cells?.items ?? []).length; columnIndex += 1) {
+        const body = rows[rowIndex]?.cells?.items?.[columnIndex]?.body;
+        if (!body || typeof body.insertText !== "function") return false;
+        body.insertText(values[rowIndex]?.[columnIndex] ?? "", "Replace");
+        writableCells += 1;
+      }
+    }
+    return writableCells > 0;
+  } catch {
+    return false;
+  }
+}
+
 function isTableFillOperation(operation: WordRangeOperation): boolean {
   return operation.name === "fillTable" || operation.name === "insertTable" || operation.name === "insertHtml" || operation.name === "insertText";
 }
@@ -754,6 +866,75 @@ async function fillOfficeTable(context: OfficeContextLike, table: OfficeTableLik
     return written ? { success: true } : { success: false, message: "Word returned a table without writable cells." };
   } catch (error) {
     return { success: false, message: `Word rejected the table-cell edit: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+async function resizeOfficeTable(context: OfficeContextLike, table: OfficeTableLike, operation: WordRangeOperation): Promise<{ success: boolean; message?: string }> {
+  const input = tableResizeInput(operation);
+  if (!input) return { success: false, message: "OpenWordCode could not read the requested table size. Use rows and columns between 1 and 100." };
+  const style = input.styleBuiltIn === undefined ? undefined : normalizeBuiltInTableStyle(input.styleBuiltIn);
+  if (input.styleBuiltIn !== undefined && !style) return { success: false, message: "Use a valid Word built-in table style, such as GridTable4_Accent1" };
+  if (typeof table.load !== "function") return { success: false, message: "Word did not expose the selected table." };
+
+  try {
+    let currentRows = 0;
+    let currentColumns = 0;
+    let currentValues: string[][] | undefined;
+    try {
+      table.load("rowCount,columnCount,values");
+      await context.sync();
+      const loadedRows = Number(table.rowCount);
+      const loadedColumns = Number(table.columnCount);
+      if (Number.isInteger(loadedRows) && loadedRows >= 1 && Number.isInteger(loadedColumns) && loadedColumns >= 1) {
+        currentRows = loadedRows;
+        currentColumns = loadedColumns;
+        currentValues = normalizedTableValues(table.values) ?? undefined;
+      }
+    } catch {
+      // Older Word builds may reject rowCount/columnCount/values even though
+      // they still expose table.rows and table.rows.items.
+    }
+    if (!currentRows || !currentColumns) {
+      const discovered = await discoverOfficeTableGrid(context, table);
+      if (discovered) {
+        currentRows = discovered.rows;
+        currentColumns = discovered.columns;
+        currentValues = discovered.values;
+      }
+    }
+    if (!currentRows || !currentColumns) {
+      return { success: false, message: "Word did not expose the selected table rows or dimensions. Select the table again and retry." };
+    }
+
+    const sourceValues: string[][] = input.values ?? (input.preserveContent ? currentValues ?? [] : []);
+    const desiredValues = Array.from({ length: input.rows }, (_row, rowIndex) => Array.from({ length: input.columns }, (_cell, columnIndex) => String(sourceValues[rowIndex]?.[columnIndex] ?? "")));
+    const rowDelta = input.rows - currentRows;
+    const columnDelta = input.columns - currentColumns;
+    if (rowDelta > 0) {
+      if (typeof table.addRows !== "function") return { success: false, message: "This Word version does not expose table row resizing. Update Office and retry." };
+      table.addRows("End", rowDelta);
+    } else if (rowDelta < 0) {
+      if (typeof table.deleteRows !== "function") return { success: false, message: "This Word version does not expose table row deletion. Update Office and retry." };
+      table.deleteRows(input.rows, -rowDelta);
+    }
+    if (columnDelta > 0) {
+      if (typeof table.addColumns !== "function") return { success: false, message: "This Word version does not expose table column resizing. Update Office and retry." };
+      table.addColumns("End", columnDelta);
+    } else if (columnDelta < 0) {
+      if (typeof table.deleteColumns !== "function") return { success: false, message: "This Word version does not expose table column deletion. Update Office and retry." };
+      table.deleteColumns(input.columns, -columnDelta);
+    }
+    await context.sync();
+
+    const shouldWriteValues = Boolean(input.values || currentValues || !input.preserveContent);
+    if (shouldWriteValues && !(await writeOfficeTableValues(context, table, desiredValues))) {
+      return { success: false, message: "Word resized the table but did not expose writable cell values." };
+    }
+    if (style) table.styleBuiltIn = style;
+    await context.sync();
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `Word rejected the selected table resize: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
@@ -858,15 +1039,20 @@ function normalizeBuiltInTableStyle(value: unknown): string | null {
   return null;
 }
 
+function tableStyleInput(operation: WordRangeOperation): unknown {
+  return operation.value !== undefined ? operation.value : operation.args?.[0];
+}
+
 function executeOfficeTableOperation(table: OfficeTableLike, operation: WordRangeOperation): { success: boolean; message?: string } {
   if (operation.name === "styleBuiltIn") {
-    if (!("value" in operation)) return { success: false, message: "Word.Table styleBuiltIn requires a value" };
-    const style = normalizeBuiltInTableStyle(operation.value);
+    const styleInput = tableStyleInput(operation);
+    if (styleInput === undefined) return { success: false, message: "Word.Table styleBuiltIn requires a value" };
+    const style = normalizeBuiltInTableStyle(styleInput);
     if (!style) return { success: false, message: "Use a valid Word built-in table style, such as GridTable4_Accent1" };
-    return executeOfficeRangeOperation(table as unknown as OfficeRangeLike, { ...operation, value: style });
+    return executeOfficeRangeOperation(table as unknown as OfficeRangeLike, { ...operation, args: [], value: style });
   }
   if (operation.name === "style") {
-    const style = normalizeBuiltInTableStyle(operation.value);
+    const style = normalizeBuiltInTableStyle(tableStyleInput(operation));
     if (style) return executeOfficeRangeOperation(table as unknown as OfficeRangeLike, { ...operation, name: "styleBuiltIn", value: style });
   }
   if (operation.name === "set" && operation.value && typeof operation.value === "object" && !Array.isArray(operation.value)) {
@@ -926,7 +1112,7 @@ function memoryRangeOperation(operation: WordRangeOperation): { success: boolean
     const text = (operation.value as { text?: unknown }).text;
     if (typeof text === "string") return { success: true, action: "replace", text };
   }
-  if (["insertBookmark", "insertCanvas", "insertComment", "insertContentControl", "insertEndnote", "insertField", "insertFileFromBase64", "insertFootnote", "insertGeometricShape", "insertInlinePictureFromBase64", "insertPictureFromBase64", "insertTextBox", "highlight", "removeHighlight", "select"].includes(operation.name)) return { success: true, action: "noop" };
+  if (["insertBookmark", "insertCanvas", "insertComment", "insertContentControl", "insertEndnote", "insertField", "insertFileFromBase64", "insertFootnote", "insertGeometricShape", "insertInlinePictureFromBase64", "insertPictureFromBase64", "insertTextBox", "highlight", "removeHighlight", "resizeTable", "select"].includes(operation.name)) return { success: true, action: "noop" };
   return { success: false, message: `Preview adapter cannot render Range.${operation.name} yet` };
 }
 
@@ -1042,7 +1228,8 @@ export class OfficeWordAdapter implements WordApplicationAdapter {
             if (selectedPictures) selectedPictures.load("items");
             selection.load("text");
             await context.sync();
-            if (selection.text !== (change.before ?? change.target.beforeText)) return { success: false, message: "The Word selection changed before this edit could be applied." };
+            const expectedSelection = change.before ?? change.target.beforeText;
+            if (selection.text !== expectedSelection && comparableText(selection.text) !== comparableText(expectedSelection)) return { success: false, message: "The Word selection changed before this edit could be applied." };
             if (operation && (WORD_VISUAL_OPERATIONS as readonly string[]).includes(operation.name) && selectedPictures?.items.length) {
               const applied = await applyVisualOperation(context, document.body, change, operation, selectedPictures.items[0]);
               if (!applied.success) return applied;
@@ -1050,12 +1237,19 @@ export class OfficeWordAdapter implements WordApplicationAdapter {
               return { success: true };
             }
             const tableInfo = await selectionTableInfo(context, selection);
-            const shouldUseSelectedTable = Boolean(operation && (operation.scope === "table" || (tableInfo.isTable && isTableFillOperation(operation))));
+            const shouldUseSelectedTable = Boolean(operation && (operation.scope === "table" || (tableInfo.isTable && (isTableFillOperation(operation) || operation.name === "resizeTable"))));
             if (shouldUseSelectedTable && operation) {
               if (!tableInfo.table) return { success: false, message: "Word did not expose the selected table. Select the table again and retry." };
               if (operation.name === "delete") {
                 if (typeof tableInfo.table.delete !== "function") return { success: false, message: "This Word version does not expose table deletion." };
                 tableInfo.table.delete();
+              } else if (operation.name === "resizeTable" || operation.name === "insertTable") {
+                // Never insert a new table into a selected table cell. A
+                // provider may still return the public Range.insertTable
+                // operation, so reinterpret it as a safe resize of the
+                // existing Word.Table instead of creating a nested table.
+                const resized = await resizeOfficeTable(context, tableInfo.table, operation);
+                if (!resized.success) return resized;
               } else if (isTableFillOperation(operation)) {
                 const source = tableFillSource(operation);
                 if (!source) return { success: false, message: "OpenWordCode could not read the requested table values. Please specify the cell values or ask for sequential labels." };
@@ -1127,8 +1321,27 @@ export class OfficeWordAdapter implements WordApplicationAdapter {
     }
   }
 
+  async revertChange(_change: ProposedChange): Promise<{ success: boolean; message?: string }> {
+    try {
+      return await this.word.run(async context => {
+        const document = context.document;
+        if (typeof document.undo !== "function") {
+          return { success: false, message: "This Word version does not expose safe document undo. Update Word and try again." };
+        }
+        const result = document.undo(1);
+        await context.sync();
+        if (result && typeof result.value === "boolean" && !result.value) {
+          return { success: false, message: "Word could not revert the latest edit." };
+        }
+        return { success: true };
+      });
+    } catch (error) {
+      return { success: false, message: `Word could not revert this edit: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
   diagnostics(): Record<string, string | boolean | undefined> {
-    return { officeAvailable: Boolean(officeGlobals().Office), wordApiAvailable: Boolean(officeGlobals().Word), changeTrackingAvailable: supportsWordApi("1.4"), host: officeGlobals().Office?.host, platform: officeGlobals().Office?.platform };
+    return { officeAvailable: Boolean(officeGlobals().Office), wordApiAvailable: Boolean(officeGlobals().Word), changeTrackingAvailable: supportsWordApi("1.4"), undoAvailable: supportsWordApi("1.4"), host: officeGlobals().Office?.host, platform: officeGlobals().Office?.platform };
   }
 }
 
@@ -1138,6 +1351,7 @@ export class MemoryWordAdapter implements WordApplicationAdapter {
   private documentText: string;
   private paragraphs: DocumentParagraph[];
   private visualElements: DocumentVisualElement[];
+  private undoStack: Array<{ changeId: string; selectionText: string; documentText: string; paragraphs: DocumentParagraph[]; visualElements: DocumentVisualElement[] }> = [];
 
   constructor(initial?: { selection?: string; documentText?: string; visualElements?: DocumentVisualElement[] }) {
     this.selectionText = initial?.selection ?? "The customers needs to submit the form.";
@@ -1155,11 +1369,12 @@ export class MemoryWordAdapter implements WordApplicationAdapter {
     const paragraphAtIndex = change.target.paragraphIndex !== undefined ? this.paragraphs[change.target.paragraphIndex] : undefined;
     const visual = change.target.kind === "visual" ? this.visualElements.find(item => item.id === change.target.id) ?? this.visualElements.find(item => item.kind === change.target.visualKind && item.index === change.target.visualIndex) : undefined;
     const current = change.target.kind === "selection" ? this.selectionText : change.target.kind === "document" ? this.documentText : change.target.kind === "visual" ? (visual ? visualElementTargetText(visual) : undefined) : this.paragraphs.find(item => item.id === change.target.id)?.text ?? paragraphAtIndex?.text;
-    if (current !== expected) return { success: false, message: "The preview document changed before this edit could be applied." };
+    if (current !== expected && comparableText(current ?? "") !== comparableText(expected)) return { success: false, message: "The preview document changed before this edit could be applied." };
     const operation = change.type === "range_operation" ? change.operation : undefined;
     const legacyTextChange = (change.type === "replace_text" || change.type === "insert_text") && typeof change.after === "string";
     if (!legacyTextChange && (!operation || !isWordRangeMutation(operation.name))) return { success: false, message: `Preview adapter does not yet apply ${change.type} changes` };
     if (change.target.kind === "visual" && operation && visual) {
+      this.undoStack.push(this.captureState(change.id));
       const descriptor = operationDescriptor(operation);
       if (operation.name === "deleteImage") this.visualElements = this.visualElements.filter(item => item.id !== visual.id);
       else if (operation.name === "resizeImage" || operation.name === "resizeShape") {
@@ -1184,6 +1399,7 @@ export class MemoryWordAdapter implements WordApplicationAdapter {
     const operationResult = operation ? memoryRangeOperation(operation) : { success: true, action: change.type === "replace_text" ? "replace" as const : "append" as const, text: change.after as string };
     if (!operationResult.success) return { success: false, message: operationResult.message };
     if (operationResult.action === "noop") return { success: true };
+    this.undoStack.push(this.captureState(change.id));
     if (change.target.kind === "selection") {
       const replacement = operationResult.text ?? "";
       const nextSelection = operationResult.action === "replace" || operationResult.action === "clear"
@@ -1213,11 +1429,34 @@ export class MemoryWordAdapter implements WordApplicationAdapter {
     return { success: true };
   }
 
+  async revertChange(change: ProposedChange): Promise<{ success: boolean; message?: string }> {
+    const previous = this.undoStack[this.undoStack.length - 1];
+    if (!previous || previous.changeId !== change.id) {
+      return { success: false, message: "Only the latest edit can be reverted safely." };
+    }
+    this.undoStack.pop();
+    this.selectionText = previous.selectionText;
+    this.documentText = previous.documentText;
+    this.paragraphs = previous.paragraphs.map(item => ({ ...item }));
+    this.visualElements = previous.visualElements.map(item => ({ ...item }));
+    return { success: true };
+  }
+
   diagnostics(): Record<string, string | boolean | undefined> {
     return { officeAvailable: false, wordApiAvailable: false, host: "Memory preview", platform: "Browser" };
   }
 
   setSelection(text: string): void { this.selectionText = text; }
+
+  private captureState(changeId: string): { changeId: string; selectionText: string; documentText: string; paragraphs: DocumentParagraph[]; visualElements: DocumentVisualElement[] } {
+    return {
+      changeId,
+      selectionText: this.selectionText,
+      documentText: this.documentText,
+      paragraphs: this.paragraphs.map(item => ({ ...item })),
+      visualElements: this.visualElements.map(item => ({ ...item })),
+    };
+  }
 
   private makeParagraphs(text: string): DocumentParagraph[] {
     return text.split(/\r?\n/).map((value, index) => ({ id: paragraphId(index, value), index, text: value }));
